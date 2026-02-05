@@ -144,8 +144,13 @@ pear -v
 ```
 
 **Clone location warning (multi‑repo setups):**
-- Do **not** clone over an existing working tree.
-- Clone into an **empty workspace directory**, then `cd` into the **app root** (the folder that contains this app’s `package.json`) before running `npm install`.
+- Do **not** clone into `/Applications/MAMP/htdocs/intercom` if that repo already exists.
+- If you’re working in a separate workspace (e.g., `/Applications/MAMP/htdocs/intercom-test`), clone **inside that workspace**:
+```bash
+git clone https://github.com/Trac-Systems/intercom ./intercom
+cd intercom/trac/contract-test-latest
+npm install
+```
 
 ### Core Updates (npm + Pear)
 Use this for dependency refreshes and runtime updates only. **Do not change repo pins** unless explicitly instructed.
@@ -154,7 +159,7 @@ Questions to ask first:
 - Updating **npm deps**, **Pear runtime**, or **both**?
 - Any peers running that must be stopped?
 
-Commands (run in the **app root** for this project):
+Commands (run in `trac/contract-test-latest`):
 ```bash
 # ensure Node 22
 node -v
@@ -436,7 +441,7 @@ Intercom must expose and describe all interactive commands so agents can operate
    If you want a canonical welcome, sign it once with the designated owner key and reuse the same `welcome_b64` across peers.
 
 ### Wallet Usage (Do Not Generate New Keys)
-- **Default rule:** use the **existing peer wallet** from the peer store (its `db/keypair.json`).  
+- **Default rule:** use the peer wallet from the store: `stores/<peer>/db/keypair.json`.  
   Do **not** generate a new wallet for signing invites/welcomes.
 - Prefer **CLI signing** on the running peer:
   - `/sc_welcome` and `/sc_invite` always sign with the **store wallet**.
@@ -590,7 +595,7 @@ MSB uses `trac-wallet` for wallet/keypair handling. Ensure it resolves to **`tra
 When using Git-pinned deps (trac-peer + main_settlement_bus), make sure you run `npm install` inside each repo before running anything with Pear.
 
 ### How to use the MSB CLI for transfers
-1) Use the **same wallet keypair** as your peer by copying the peer’s `keypair.json` into the MSB store’s `db` folder.  
+1) Use the **same wallet keypair** as your peer by copying `keypair.json` into the MSB store’s `db` folder.  
 2) In the MSB CLI, run `/get_balance <trac1...>` to verify funds.  
 3) Run `/transfer <to_address> <amount>` to send TNK (fee: 0.03 TNK).
 
@@ -598,7 +603,7 @@ The address used for TNK fees is the peer’s **Trac address** (bech32m, `trac1.
 You can read it directly in the startup banner as **Peer trac address (bech32m)** or via `/msb` (shows `peerMsbAddress`).
 
 ### Wallet Identity (keypair.json)
-Each peer’s wallet identity is stored in its **peer store** under `db/keypair.json`.  
+Each peer’s wallet identity is stored in `stores/<peer-store-name>/db/keypair.json`.  
 This file is the **wallet identity** (keys + mnemonic). If you want multiple apps/subnets to share the same wallet and funds, copy this file into the other peer store **before** starting it.
 
 ## RPC vs Interactive CLI
