@@ -55,6 +55,8 @@ These choices should be surfaced as the initial configuration flow for the skill
 - **Autonomous agents MUST use SC‑Bridge** for sidechannel I/O and command execution.
 - **Do not use the interactive TTY** unless a human explicitly requests it.
 - If a request is ambiguous (e.g., “send a message”), **default to SC‑Bridge**.
+- **Install/run honesty:** if an agent starts a peer inside its own session, **do not claim it is “running”** after the agent exits.  
+  Instead, generate a **run script** for humans to start the peer and **track that script** for future changes.
 
 ## Quick Start (Clone + Run)
 Use Pear runtime only (never native node).
@@ -149,6 +151,30 @@ git clone https://github.com/Trac-Systems/intercom ./intercom
 cd intercom/trac/contract-test-latest
 npm install
 ```
+
+### Core Updates (npm + Pear)
+Use this for dependency refreshes and runtime updates only. **Do not change repo pins** unless explicitly instructed.
+
+Questions to ask first:
+- Updating **npm deps**, **Pear runtime**, or **both**?
+- Any peers running that must be stopped?
+
+Commands (run in `trac/contract-test-latest`):
+```bash
+# ensure Node 22
+node -v
+
+# update deps
+npm install
+
+# refresh Pear runtime
+pear -v
+```
+
+Notes:
+- Pear uses the currently active Node; ensure **Node 22** before running `pear -v`.
+- Stop peers before updating, restart afterward.
+- Keep repo pins unchanged.
 
 To ensure trac-peer does not pull an older wallet, enforce `trac-wallet@1.0.1` via npm overrides:
 ```bash
