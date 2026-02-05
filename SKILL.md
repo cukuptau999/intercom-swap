@@ -151,7 +151,7 @@ git clone https://github.com/Trac-Systems/intercom ./intercom
 cd intercom
 npm install
 ```
-Then change into the **app folder that contains this SKILL.md** and its `package.json` (the `contract-test-latest` app).  
+Then change into the **app folder that contains this SKILL.md** and its `package.json`.  
 All commands below assume you are working from that app folder.
 
 ### Core Updates (npm + Pear)
