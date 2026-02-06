@@ -58,6 +58,18 @@ These choices should be surfaced as the initial configuration flow for the skill
 - **Install/run honesty:** if an agent starts a peer inside its own session, **do not claim it is “running”** after the agent exits.  
   Instead, generate a **run script** for humans to start the peer and **track that script** for future changes.
 
+## Deterministic Scripts (Mandatory)
+To keep operation non-fuzzy and cross-platform, any agent guidance MUST be delivered as scripts:
+- macOS/Linux: `.sh`
+- Windows: `.ps1`
+
+This repo includes `scripts/swapctl.mjs` (with wrappers `scripts/swapctl.sh` and `scripts/swapctl.ps1`) to deterministically:
+- open/join/send sidechannels over SC-Bridge
+- create owner-signed welcomes + invites (via SC-Bridge signing)
+- send signed swap messages (`rfq`, `quote`, `terms`, `accept`) with schema validation
+
+If a request cannot be fulfilled with a one-liner, create role-specific scripts (service vs client) that fully specify flags, channels, RPC endpoints, and wallet paths.
+
 ## Quick Start (Clone + Run)
 Use Pear runtime only (never native node).
 
@@ -241,6 +253,10 @@ Core:
 - `--subnet-channel <name>` : subnet/app identity.
 - `--subnet-bootstrap <hex>` : admin **Peer Writer** key for joiners.
 - `--msb 0|1` (or `--enable-msb 0|1`) : enable/disable MSB networking (**default: 1**). Use `0` for sidechannel-only mode and unattended e2e tests.
+- `--dht-bootstrap "<node1,node2>"` : override HyperDHT bootstrap nodes used by Hyperswarm (comma-separated).
+  - Node format: `<host>:<port>` or `[suggested-ip@]<host>:<port>`.
+  - Leave unset to use defaults.
+  - This is **not** `--subnet-bootstrap` (writer key hex). DHT bootstrap is networking; subnet bootstrap is app/subnet identity.
 
 Sidechannels:
 - `--sidechannels a,b,c` (or `--sidechannel a,b,c`) : extra sidechannels to join at startup.
@@ -681,6 +697,24 @@ What `npm run test:e2e` does:
 ### Production Notes (Not Implemented Here Yet)
 - Lightning mainnet/testnet: run your own CLN/LND and connect via RPC credentials stored under `onchain/`.
 - Solana mainnet: prefer an RPC provider; self-hosting Solana RPC is operationally heavy and storage-intensive.
+
+### Public RPC / API Endpoints (Fallback-Only)
+These are useful for development and light usage. They are rate-limited and may change or block you.
+
+Solana (public RPC endpoints):
+- `https://api.mainnet-beta.solana.com` (mainnet)
+- `https://api.devnet.solana.com` (devnet)
+- `https://api.testnet.solana.com` (testnet)
+- `https://rpc.ankr.com/solana` (mainnet, third-party)
+- `https://rpc.ankr.com/solana_devnet` (devnet, third-party)
+
+Bitcoin (Esplora-compatible explorer APIs):
+- Blockstream: `https://blockstream.info/api/` (mainnet), `https://blockstream.info/testnet/api/`, `https://blockstream.info/signet/api/`
+- mempool.space: `https://mempool.space/api/` (mainnet) and similar paths for test networks (verify before relying on them)
+  - Many Esplora APIs support raw-tx broadcast via `POST /tx` (send hex in request body), but you must verify per endpoint before production use.
+
+Hard rule for production: endpoints MUST be user-configurable (comma-separated list, failover on errors). For real reliability, use your own RPC or a paid provider.
+
 
 ## Notes
 - The skill must always use Pear runtime (never native node).
