@@ -1004,7 +1004,8 @@ scripts/lnctl.sh info --impl cln --backend cli --network bitcoin
 #
 # Maker node
 scripts/lndpw.sh onchain/lnd/signet/maker/wallet.pw
-scripts/lndctl.sh init --node maker --network signet --bitcoin-node neutrino --neutrino-peers "<peer1:8333,peer2:8333>" \
+# Neutrino peers must match the network port (mainnet 8333, testnet 18333, signet 38333).
+scripts/lndctl.sh init --node maker --network signet --bitcoin-node neutrino --neutrino-peers "<peer1:port,peer2:port>" \
   --p2p-port 9735 --rpc-port 10009 --rest-port 8080 \
   --wallet-password-file onchain/lnd/signet/maker/wallet.pw
 scripts/lndctl.sh start --node maker --network signet
@@ -1013,7 +1014,7 @@ scripts/lndctl.sh create-wallet --node maker --network signet
 
 # Taker node (use different ports if on same machine)
 scripts/lndpw.sh onchain/lnd/signet/taker/wallet.pw
-scripts/lndctl.sh init --node taker --network signet --bitcoin-node neutrino --neutrino-peers "<peer1:8333,peer2:8333>" \
+scripts/lndctl.sh init --node taker --network signet --bitcoin-node neutrino --neutrino-peers "<peer1:port,peer2:port>" \
   --p2p-port 9736 --rpc-port 10010 --rest-port 8081 \
   --wallet-password-file onchain/lnd/signet/taker/wallet.pw
 scripts/lndctl.sh start --node taker --network signet
