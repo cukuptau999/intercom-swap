@@ -60,6 +60,8 @@ Recommended:
 - OpenAI: **GPT-5.3+** (Codex, `xhigh`)
 - Anthropic: **Claude Opus 4.6+**
 
+OpenClaw can use and control this stack autonomously (install/upgrade via `SKILL.md`, ops via scripts and optional `promptd` tool calls).
+
 Local/open-weight models can work too, but use a high-grade one.
 
 ---
