@@ -76,6 +76,9 @@ function expectString(args, toolName, key, { min = 1, max = 10_000, pattern = nu
 
 function expectOptionalString(args, toolName, key, { min = 1, max = 10_000, pattern = null } = {}) {
   if (!(key in args) || args[key] === null || args[key] === undefined) return null;
+  // Treat empty/whitespace strings as "not set" for optional fields. This makes the tool surface
+  // more robust against weaker models that emit "" for optional strings.
+  if (typeof args[key] === 'string' && !String(args[key]).trim()) return null;
   return expectString(args, toolName, key, { min, max, pattern });
 }
 
@@ -246,6 +249,14 @@ export class ToolExecutor {
     this.solana = solana; // { rpcUrls, commitment, programId, keypairPath, computeUnitLimit, computeUnitPriceMicroLamports }
     this.receipts = receipts; // { dbPath }
 
+    // Persistent SC-Bridge session for subscriptions + event polling.
+    this._sc = null;
+    this._scConnecting = null;
+    this._scSubscribed = new Set();
+    this._scWaiters = new Set(); // { filter, resolve, reject, timer }
+    this._scQueue = [];
+    this._scQueueMax = 500;
+
     this._solanaKeypair = null;
     this._solanaPool = null;
   }
@@ -282,6 +293,96 @@ export class ToolExecutor {
     return this._solanaKeypair;
   }
 
+  async _scEnsurePersistent({ timeoutMs = 10_000 } = {}) {
+    if (this._sc && this._sc.ws) return this._sc;
+    if (this._scConnecting) return this._scConnecting;
+
+    this._scConnecting = (async () => {
+      const sc = new ScBridgeClient({ url: this.scBridge.url, token: this.scBridge.token });
+      await sc.connect({ timeoutMs });
+
+      sc.on('sidechannel_message', (msg) => {
+        try {
+          this._onScEvent(msg);
+        } catch (_e) {}
+      });
+
+      // Re-apply subscriptions on reconnect.
+      if (this._scSubscribed.size > 0) {
+        await sc.subscribe(Array.from(this._scSubscribed));
+      }
+
+      this._sc = sc;
+      this._scConnecting = null;
+      return sc;
+    })().catch((err) => {
+      this._scConnecting = null;
+      throw err;
+    });
+
+    return this._scConnecting;
+  }
+
+  _onScEvent(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type !== 'sidechannel_message') return;
+    const channel = String(msg.channel || '').trim();
+    if (!channel) return;
+
+    const evt = {
+      type: 'sidechannel_message',
+      channel,
+      id: msg.id ?? null,
+      from: msg.from ?? null,
+      origin: msg.origin ?? null,
+      relayedBy: msg.relayedBy ?? null,
+      ttl: msg.ttl ?? null,
+      ts: msg.ts ?? Date.now(),
+      message: msg.message,
+    };
+
+    // Deliver directly to a waiter (consume once), otherwise enqueue.
+    for (const waiter of this._scWaiters) {
+      try {
+        if (waiter.filter(evt)) {
+          this._scWaiters.delete(waiter);
+          clearTimeout(waiter.timer);
+          waiter.resolve(evt);
+          return;
+        }
+      } catch (_e) {}
+    }
+
+    this._scQueue.push(evt);
+    if (this._scQueue.length > this._scQueueMax) {
+      this._scQueue.splice(0, this._scQueue.length - this._scQueueMax);
+    }
+  }
+
+  async _scWaitFor(filterFn, { timeoutMs = 10_000 } = {}) {
+    // First, drain from queue.
+    for (let i = 0; i < this._scQueue.length; i += 1) {
+      const evt = this._scQueue[i];
+      try {
+        if (filterFn(evt)) {
+          this._scQueue.splice(i, 1);
+          return evt;
+        }
+      } catch (_e) {}
+    }
+
+    if (!timeoutMs || timeoutMs <= 0) return null;
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._scWaiters.delete(waiter);
+        resolve(null);
+      }, timeoutMs);
+      const waiter = { filter: filterFn, resolve, reject, timer };
+      this._scWaiters.add(waiter);
+    });
+  }
+
   async execute(toolName, args, { autoApprove = false, dryRun = false, secrets = null } = {}) {
     assertPlainObject(args ?? {}, toolName);
 
@@ -297,6 +398,87 @@ export class ToolExecutor {
     if (toolName === 'intercomswap_sc_price_get') {
       assertAllowedKeys(args, toolName, []);
       return withScBridge(this.scBridge, (sc) => sc.priceGet());
+    }
+
+    // SC-Bridge event stream helpers (persistent connection).
+    if (toolName === 'intercomswap_sc_subscribe') {
+      assertAllowedKeys(args, toolName, ['channels']);
+      const channels = args.channels;
+      if (!Array.isArray(channels) || channels.length < 1) {
+        throw new Error(`${toolName}: channels must be a non-empty array`);
+      }
+      const list = channels.map((c) => normalizeChannelName(String(c)));
+      for (const ch of list) this._scSubscribed.add(ch);
+      if (dryRun) return { type: 'dry_run', tool: toolName, channels: list };
+      const sc = await this._scEnsurePersistent();
+      await sc.subscribe(list);
+      return { type: 'subscribed', channels: Array.from(this._scSubscribed) };
+    }
+
+    if (toolName === 'intercomswap_sc_wait_envelope') {
+      assertAllowedKeys(args, toolName, ['channels', 'kinds', 'timeout_ms']);
+      const channels = Array.isArray(args.channels) ? args.channels.map((c) => normalizeChannelName(String(c))) : [];
+      const kinds = Array.isArray(args.kinds) ? args.kinds.map((k) => String(k || '').trim()).filter(Boolean) : [];
+      const timeoutMs = Number.isInteger(args.timeout_ms) ? args.timeout_ms : 10_000;
+      if (timeoutMs < 10 || timeoutMs > 120_000) throw new Error(`${toolName}: timeout_ms out of range`);
+
+      if (!secrets || typeof secrets.put !== 'function') {
+        throw new Error(`${toolName}: secrets store required`);
+      }
+
+      await this._scEnsurePersistent();
+      const channelAllow = new Set(channels);
+      const kindAllow = new Set(kinds);
+
+      const evt = await this._scWaitFor(
+        (e) => {
+          if (!e || typeof e !== 'object') return false;
+          if (channels.length > 0 && !channelAllow.has(e.channel)) return false;
+          const msg = e.message;
+          if (!isObject(msg)) return false;
+          const v = validateSwapEnvelope(msg);
+          if (!v.ok) return false;
+          if (kinds.length > 0 && !kindAllow.has(String(msg.kind))) return false;
+          return true;
+        },
+        { timeoutMs }
+      );
+
+      if (!evt) return { type: 'timeout', timeout_ms: timeoutMs };
+
+      const env = evt.message;
+      const envId = hashUnsignedEnvelope(stripSignature(env));
+      const sigOk = verifySignedEnvelope(env);
+      const handle = secrets.put(env, { key: 'swap_envelope', channel: evt.channel, id: envId, kind: env.kind });
+
+      const out = {
+        type: 'swap_envelope',
+        channel: evt.channel,
+        kind: env.kind,
+        trade_id: env.trade_id,
+        envelope_id: envId,
+        signer: env.signer || null,
+        ts: env.ts || null,
+        signature_ok: Boolean(sigOk.ok),
+        envelope_handle: handle,
+        from: evt.from,
+        origin: evt.origin,
+        relayedBy: evt.relayedBy,
+        ttl: evt.ttl,
+      };
+
+      // Add minimal kind-specific summary fields (safe, small).
+      if (isObject(env.body)) {
+        if (env.kind === KIND.RFQ || env.kind === KIND.QUOTE || env.kind === KIND.TERMS) {
+          if (env.body.btc_sats !== undefined) out.btc_sats = env.body.btc_sats;
+          if (env.body.usdt_amount !== undefined) out.usdt_amount = env.body.usdt_amount;
+        }
+        if (env.body.rfq_id !== undefined) out.rfq_id = env.body.rfq_id;
+        if (env.body.quote_id !== undefined) out.quote_id = env.body.quote_id;
+        if (env.kind === KIND.SWAP_INVITE && env.body.swap_channel) out.swap_channel = env.body.swap_channel;
+      }
+
+      return out;
     }
 
     // SC-Bridge mutations
@@ -384,14 +566,28 @@ export class ToolExecutor {
     }
 
     if (toolName === 'intercomswap_quote_post') {
-      assertAllowedKeys(args, toolName, ['channel', 'trade_id', 'rfq_id', 'btc_sats', 'usdt_amount', 'valid_until_unix']);
+      assertAllowedKeys(args, toolName, [
+        'channel',
+        'trade_id',
+        'rfq_id',
+        'btc_sats',
+        'usdt_amount',
+        'valid_until_unix',
+        'valid_for_sec',
+      ]);
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
       const rfqId = normalizeHex32(expectString(args, toolName, 'rfq_id', { min: 64, max: 64 }), 'rfq_id');
       const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
       const usdtAmount = normalizeAtomicAmount(expectString(args, toolName, 'usdt_amount', { max: 64 }), 'usdt_amount');
-      const validUntil = expectInt(args, toolName, 'valid_until_unix', { min: 1 });
+      const validUntilRaw = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
+      const validFor = expectOptionalInt(args, toolName, 'valid_for_sec', { min: 10, max: 60 * 60 * 24 * 7 });
+      const nowSec = Math.floor(Date.now() / 1000);
+      const validUntil = validUntilRaw ?? (validFor ? nowSec + validFor : null);
+      if (!validUntil) {
+        throw new Error(`${toolName}: valid_until_unix or valid_for_sec is required`);
+      }
 
       const unsigned = createUnsignedEnvelope({
         v: 1,
@@ -415,11 +611,60 @@ export class ToolExecutor {
       });
     }
 
+    if (toolName === 'intercomswap_quote_post_from_rfq') {
+      assertAllowedKeys(args, toolName, ['channel', 'rfq_envelope', 'valid_until_unix', 'valid_for_sec']);
+      requireApproval(toolName, autoApprove);
+      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
+      const rfq = resolveSecretArg(secrets, args.rfq_envelope, { label: 'rfq_envelope', expectType: 'object' });
+      if (!isObject(rfq)) throw new Error(`${toolName}: rfq_envelope must be an object`);
+      const v = validateSwapEnvelope(rfq);
+      if (!v.ok) throw new Error(`${toolName}: invalid rfq_envelope: ${v.error}`);
+      if (rfq.kind !== KIND.RFQ) throw new Error(`${toolName}: rfq_envelope.kind must be ${KIND.RFQ}`);
+      const sigOk = verifySignedEnvelope(rfq);
+      if (!sigOk.ok) throw new Error(`${toolName}: rfq_envelope signature invalid: ${sigOk.error}`);
+
+      const tradeId = String(rfq.trade_id);
+      const btcSats = Number(rfq?.body?.btc_sats);
+      if (!Number.isInteger(btcSats) || btcSats < 1) throw new Error(`${toolName}: rfq_envelope.body.btc_sats invalid`);
+      const usdtAmount = normalizeAtomicAmount(String(rfq?.body?.usdt_amount), 'rfq_envelope.body.usdt_amount');
+
+      const rfqId = hashUnsignedEnvelope(stripSignature(rfq));
+
+      const validUntilRaw = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
+      const validFor = expectOptionalInt(args, toolName, 'valid_for_sec', { min: 10, max: 60 * 60 * 24 * 7 });
+      const nowSec = Math.floor(Date.now() / 1000);
+      const validUntil = validUntilRaw ?? (validFor ? nowSec + validFor : null);
+      if (!validUntil) {
+        throw new Error(`${toolName}: valid_until_unix or valid_for_sec is required`);
+      }
+
+      const unsigned = createUnsignedEnvelope({
+        v: 1,
+        kind: KIND.QUOTE,
+        tradeId,
+        body: {
+          rfq_id: rfqId,
+          pair: PAIR.BTC_LN__USDT_SOL,
+          direction: `${ASSET.BTC_LN}->${ASSET.USDT_SOL}`,
+          btc_sats: btcSats,
+          usdt_amount: usdtAmount,
+          valid_until_unix: validUntil,
+        },
+      });
+      const quoteId = hashUnsignedEnvelope(unsigned);
+      if (dryRun) return { type: 'dry_run', tool: toolName, channel, quote_id: quoteId, unsigned };
+      return withScBridge(this.scBridge, async (sc) => {
+        const signed = await signSwapEnvelope(sc, unsigned);
+        await sendEnvelope(sc, channel, signed);
+        return { type: 'quote_posted', channel, quote_id: quoteId, envelope: signed, rfq_id: rfqId };
+      });
+    }
+
     if (toolName === 'intercomswap_quote_accept') {
       assertAllowedKeys(args, toolName, ['channel', 'quote_envelope']);
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
-      const quote = args.quote_envelope;
+      const quote = resolveSecretArg(secrets, args.quote_envelope, { label: 'quote_envelope', expectType: 'object' });
       if (!isObject(quote)) throw new Error(`${toolName}: quote_envelope must be an object`);
       const v = validateSwapEnvelope(quote);
       if (!v.ok) throw new Error(`${toolName}: invalid quote_envelope: ${v.error}`);
@@ -450,7 +695,7 @@ export class ToolExecutor {
       assertAllowedKeys(args, toolName, ['channel', 'accept_envelope', 'swap_channel', 'welcome_text', 'ttl_sec']);
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
-      const accept = args.accept_envelope;
+      const accept = resolveSecretArg(secrets, args.accept_envelope, { label: 'accept_envelope', expectType: 'object' });
       if (!isObject(accept)) throw new Error(`${toolName}: accept_envelope must be an object`);
       const v = validateSwapEnvelope(accept);
       if (!v.ok) throw new Error(`${toolName}: invalid accept_envelope: ${v.error}`);
@@ -530,7 +775,7 @@ export class ToolExecutor {
     if (toolName === 'intercomswap_join_from_swap_invite') {
       assertAllowedKeys(args, toolName, ['swap_invite_envelope']);
       requireApproval(toolName, autoApprove);
-      const inv = args.swap_invite_envelope;
+      const inv = resolveSecretArg(secrets, args.swap_invite_envelope, { label: 'swap_invite_envelope', expectType: 'object' });
       if (!isObject(inv)) throw new Error(`${toolName}: swap_invite_envelope must be an object`);
       const v = validateSwapEnvelope(inv);
       if (!v.ok) throw new Error(`${toolName}: invalid swap_invite_envelope: ${v.error}`);
@@ -707,6 +952,276 @@ export class ToolExecutor {
       const paymentHashHex = normalizeHex32(expectString(args, toolName, 'payment_hash_hex', { min: 64, max: 64 }), 'payment_hash_hex');
       if (dryRun) return { type: 'dry_run', tool: toolName };
       return lnPreimageGet(this.ln, { paymentHashHex });
+    }
+
+    // Swap settlement helpers (deterministic; sign + send swap envelopes)
+    if (toolName === 'intercomswap_swap_ln_invoice_create_and_post') {
+      assertAllowedKeys(args, toolName, ['channel', 'trade_id', 'btc_sats', 'label', 'description', 'expiry_sec']);
+      requireApproval(toolName, autoApprove);
+      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
+      const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const btcSats = expectInt(args, toolName, 'btc_sats', { min: 1 });
+      const label = expectString(args, toolName, 'label', { min: 1, max: 120 });
+      const description = expectString(args, toolName, 'description', { min: 1, max: 500 });
+      const expirySec = expectOptionalInt(args, toolName, 'expiry_sec', { min: 60, max: 60 * 60 * 24 * 7 });
+      if (dryRun) return { type: 'dry_run', tool: toolName, channel, trade_id: tradeId };
+
+      const amountMsat = (BigInt(String(btcSats)) * 1000n).toString();
+      const invoice = await lnInvoice(this.ln, { amountMsat, label, description, expirySec });
+      const bolt11 = String(invoice?.bolt11 || '').trim();
+      const paymentHashHex = String(invoice?.payment_hash || '').trim().toLowerCase();
+      if (!bolt11) throw new Error(`${toolName}: invoice missing bolt11`);
+      if (!/^[0-9a-f]{64}$/.test(paymentHashHex)) throw new Error(`${toolName}: invoice missing payment_hash`);
+
+      // Best-effort decode for expiry.
+      let expiresAtUnix = null;
+      try {
+        const dec = await lnDecodePay(this.ln, { bolt11 });
+        const created = Number(dec?.created_at ?? dec?.timestamp ?? dec?.creation_date ?? null);
+        const exp = Number(dec?.expiry ?? dec?.expiry_seconds ?? null);
+        if (Number.isFinite(created) && created > 0 && Number.isFinite(exp) && exp > 0) {
+          expiresAtUnix = Math.trunc(created + exp);
+        }
+      } catch (_e) {}
+
+      const unsigned = createUnsignedEnvelope({
+        v: 1,
+        kind: KIND.LN_INVOICE,
+        tradeId,
+        body: {
+          bolt11,
+          payment_hash_hex: paymentHashHex,
+          amount_msat: String(amountMsat),
+          ...(expiresAtUnix ? { expires_at_unix: expiresAtUnix } : {}),
+        },
+      });
+
+      return withScBridge(this.scBridge, async (sc) => {
+        const signed = await signSwapEnvelope(sc, unsigned);
+        await sendEnvelope(sc, channel, signed);
+        const envHandle = secrets && typeof secrets.put === 'function'
+          ? secrets.put(signed, { key: 'ln_invoice', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+          : null;
+        return {
+          type: 'ln_invoice_posted',
+          channel,
+          trade_id: tradeId,
+          payment_hash_hex: paymentHashHex,
+          bolt11,
+          expires_at_unix: expiresAtUnix,
+          envelope_handle: envHandle,
+          envelope: envHandle ? null : signed,
+        };
+      });
+    }
+
+    if (toolName === 'intercomswap_swap_sol_escrow_init_and_post') {
+      assertAllowedKeys(args, toolName, [
+        'channel',
+        'trade_id',
+        'payment_hash_hex',
+        'mint',
+        'amount',
+        'recipient',
+        'refund',
+        'refund_after_unix',
+        'platform_fee_bps',
+        'trade_fee_bps',
+        'trade_fee_collector',
+      ]);
+      requireApproval(toolName, autoApprove);
+      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
+      const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const paymentHashHex = normalizeHex32(expectString(args, toolName, 'payment_hash_hex', { min: 64, max: 64 }), 'payment_hash_hex');
+      const mint = new PublicKey(normalizeBase58(expectString(args, toolName, 'mint', { max: 64 }), 'mint'));
+      const amountStr = normalizeAtomicAmount(expectString(args, toolName, 'amount', { max: 64 }), 'amount');
+      const amount = BigInt(amountStr);
+      const recipient = new PublicKey(normalizeBase58(expectString(args, toolName, 'recipient', { max: 64 }), 'recipient'));
+      const refund = new PublicKey(normalizeBase58(expectString(args, toolName, 'refund', { max: 64 }), 'refund'));
+      const refundAfterUnix = expectInt(args, toolName, 'refund_after_unix', { min: 1 });
+      const platformFeeBps = expectInt(args, toolName, 'platform_fee_bps', { min: 0, max: 500 });
+      const tradeFeeBps = expectInt(args, toolName, 'trade_fee_bps', { min: 0, max: 1000 });
+      const tradeFeeCollector = new PublicKey(normalizeBase58(expectString(args, toolName, 'trade_fee_collector', { max: 64 }), 'trade_fee_collector'));
+      if (dryRun) return { type: 'dry_run', tool: toolName, channel, trade_id: tradeId, payment_hash_hex: paymentHashHex };
+
+      const signer = this._requireSolanaSigner();
+      const programId = this._programId();
+      const commitment = this._commitment();
+      const { computeUnitLimit, computeUnitPriceMicroLamports } = this._computeBudget();
+
+      const build = await this._pool().call(async (connection) => {
+        const payerAta = await getOrCreateAta(connection, signer, signer.publicKey, mint, commitment);
+        return createEscrowTx({
+          connection,
+          payer: signer,
+          payerTokenAccount: payerAta,
+          mint,
+          paymentHashHex,
+          recipient,
+          refund,
+          refundAfterUnix,
+          amount,
+          expectedPlatformFeeBps: platformFeeBps,
+          expectedTradeFeeBps: tradeFeeBps,
+          tradeFeeCollector,
+          computeUnitLimit,
+          computeUnitPriceMicroLamports,
+          programId,
+        });
+      }, { label: 'swap_sol_escrow_build' });
+
+      const escrowSig = await this._pool().call((connection) => sendAndConfirm(connection, build.tx, commitment), { label: 'swap_sol_escrow_send' });
+
+      const unsigned = createUnsignedEnvelope({
+        v: 1,
+        kind: KIND.SOL_ESCROW_CREATED,
+        tradeId,
+        body: {
+          payment_hash_hex: paymentHashHex,
+          program_id: programId.toBase58(),
+          escrow_pda: build.escrowPda.toBase58(),
+          vault_ata: build.vault.toBase58(),
+          mint: mint.toBase58(),
+          amount: amountStr,
+          refund_after_unix: refundAfterUnix,
+          recipient: recipient.toBase58(),
+          refund: refund.toBase58(),
+          tx_sig: escrowSig,
+        },
+      });
+
+      return withScBridge(this.scBridge, async (sc) => {
+        const signed = await signSwapEnvelope(sc, unsigned);
+        await sendEnvelope(sc, channel, signed);
+        const envHandle = secrets && typeof secrets.put === 'function'
+          ? secrets.put(signed, { key: 'sol_escrow_created', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+          : null;
+        return {
+          type: 'sol_escrow_posted',
+          channel,
+          trade_id: tradeId,
+          payment_hash_hex: paymentHashHex,
+          program_id: programId.toBase58(),
+          escrow_pda: build.escrowPda.toBase58(),
+          vault_ata: build.vault.toBase58(),
+          tx_sig: escrowSig,
+          envelope_handle: envHandle,
+          envelope: envHandle ? null : signed,
+        };
+      });
+    }
+
+    if (toolName === 'intercomswap_swap_ln_pay_and_post') {
+      assertAllowedKeys(args, toolName, ['channel', 'trade_id', 'bolt11', 'payment_hash_hex']);
+      requireApproval(toolName, autoApprove);
+      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
+      const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const bolt11 = expectString(args, toolName, 'bolt11', { min: 20, max: 8000 });
+      const paymentHashHex = normalizeHex32(expectString(args, toolName, 'payment_hash_hex', { min: 64, max: 64 }), 'payment_hash_hex');
+      if (dryRun) return { type: 'dry_run', tool: toolName, channel, trade_id: tradeId, payment_hash_hex: paymentHashHex };
+
+      const payRes = await lnPay(this.ln, { bolt11 });
+      const preimageHex = String(payRes?.payment_preimage || '').trim().toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(preimageHex)) throw new Error(`${toolName}: missing payment_preimage`);
+
+      const unsigned = createUnsignedEnvelope({
+        v: 1,
+        kind: KIND.LN_PAID,
+        tradeId,
+        body: { payment_hash_hex: paymentHashHex },
+      });
+
+      return withScBridge(this.scBridge, async (sc) => {
+        const signed = await signSwapEnvelope(sc, unsigned);
+        await sendEnvelope(sc, channel, signed);
+        const envHandle = secrets && typeof secrets.put === 'function'
+          ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+          : null;
+        return {
+          type: 'ln_paid_posted',
+          channel,
+          trade_id: tradeId,
+          payment_hash_hex: paymentHashHex,
+          preimage_hex: preimageHex,
+          envelope_handle: envHandle,
+          envelope: envHandle ? null : signed,
+        };
+      });
+    }
+
+    if (toolName === 'intercomswap_swap_sol_claim_and_post') {
+      assertAllowedKeys(args, toolName, ['channel', 'trade_id', 'preimage_hex', 'mint']);
+      requireApproval(toolName, autoApprove);
+      const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
+      const tradeId = expectString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ });
+      const preimageArg = expectString(args, toolName, 'preimage_hex', { min: 1, max: 200 });
+      const preimageResolved = resolveSecretArg(secrets, preimageArg, { label: 'preimage_hex', expectType: 'string' });
+      const preimageHex = normalizeHex32(preimageResolved, 'preimage_hex');
+      const paymentHashHex = computePaymentHashFromPreimage(preimageHex);
+      const mint = new PublicKey(normalizeBase58(expectString(args, toolName, 'mint', { max: 64 }), 'mint'));
+      if (dryRun) return { type: 'dry_run', tool: toolName, channel, trade_id: tradeId, payment_hash_hex: paymentHashHex };
+
+      const signer = this._requireSolanaSigner();
+      const programId = this._programId();
+      const commitment = this._commitment();
+      const { computeUnitLimit, computeUnitPriceMicroLamports } = this._computeBudget();
+
+      const claimBuild = await this._pool().call(async (connection) => {
+        const escrow = await getEscrowState(connection, paymentHashHex, programId, commitment);
+        if (!escrow) throw new Error('Escrow not found');
+        if (!escrow.recipient.equals(signer.publicKey)) {
+          throw new Error(`Recipient mismatch (escrow.recipient=${escrow.recipient.toBase58()})`);
+        }
+        if (!escrow.mint.equals(mint)) throw new Error(`Mint mismatch (escrow.mint=${escrow.mint.toBase58()})`);
+
+        const tradeFeeCollector = escrow.tradeFeeCollector ?? escrow.feeCollector;
+        if (!tradeFeeCollector) throw new Error('Escrow missing tradeFeeCollector');
+
+        const recipientAta = await getOrCreateAta(connection, signer, signer.publicKey, mint, commitment);
+        return claimEscrowTx({
+          connection,
+          recipient: signer,
+          recipientTokenAccount: recipientAta,
+          mint,
+          paymentHashHex,
+          preimageHex,
+          tradeFeeCollector,
+          computeUnitLimit,
+          computeUnitPriceMicroLamports,
+          programId,
+        });
+      }, { label: 'swap_sol_claim_build' });
+
+      const claimSig = await this._pool().call((connection) => sendAndConfirm(connection, claimBuild.tx, commitment), { label: 'swap_sol_claim_send' });
+
+      const unsigned = createUnsignedEnvelope({
+        v: 1,
+        kind: KIND.SOL_CLAIMED,
+        tradeId,
+        body: {
+          payment_hash_hex: paymentHashHex,
+          escrow_pda: claimBuild.escrowPda.toBase58(),
+          tx_sig: claimSig,
+        },
+      });
+
+      return withScBridge(this.scBridge, async (sc) => {
+        const signed = await signSwapEnvelope(sc, unsigned);
+        await sendEnvelope(sc, channel, signed);
+        const envHandle = secrets && typeof secrets.put === 'function'
+          ? secrets.put(signed, { key: 'sol_claimed', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+          : null;
+        return {
+          type: 'sol_claimed_posted',
+          channel,
+          trade_id: tradeId,
+          payment_hash_hex: paymentHashHex,
+          escrow_pda: claimBuild.escrowPda.toBase58(),
+          tx_sig: claimSig,
+          envelope_handle: envHandle,
+          envelope: envHandle ? null : signed,
+        };
+      });
     }
 
     // Solana (read-only)

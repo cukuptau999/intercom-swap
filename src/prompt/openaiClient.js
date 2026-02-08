@@ -142,6 +142,16 @@ export class OpenAICompatibleClient {
         err.body = json ?? text;
         throw err;
       }
+      if (!json || typeof json !== 'object') {
+        const ct = res.headers?.get ? res.headers.get('content-type') : '';
+        const snippet = (text || '').slice(0, 400);
+        const err = new Error(
+          `LLM error: invalid JSON response (status=${res.status}, content-type=${ct || 'unknown'}): ${snippet}`
+        );
+        err.status = res.status;
+        err.body = text;
+        throw err;
+      }
 
       const toolCalls = extractToolCallsFromChatCompletion(json);
       const choice = json?.choices?.[0] ?? null;
@@ -161,4 +171,3 @@ export class OpenAICompatibleClient {
     }
   }
 }
-

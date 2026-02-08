@@ -79,7 +79,14 @@ export function loadPromptSetupFromFile({ configPath = DEFAULT_PROMPT_SETUP_PATH
   const raw = readJsonFile(resolved);
   if (!isObject(raw)) throw new Error(`Prompt setup must be a JSON object: ${resolved}`);
 
+  const agentRaw = isObject(raw.agent) ? raw.agent : {};
+  const agent = {
+    role: normalizeString(agentRaw.role, { allowEmpty: true }) || '',
+  };
+
   const llmRaw = isObject(raw.llm) ? raw.llm : {};
+  const llmResponseFormat = isObject(llmRaw.response_format) ? llmRaw.response_format : null;
+  const llmExtraBody = isObject(llmRaw.extra_body) ? llmRaw.extra_body : null;
   const llm = {
     baseUrl: normalizeString(llmRaw.base_url),
     apiKey: normalizeApiKey(llmRaw.api_key),
@@ -92,6 +99,8 @@ export function loadPromptSetupFromFile({ configPath = DEFAULT_PROMPT_SETUP_PATH
     repetitionPenalty: parseFloatLike(llmRaw.repetition_penalty, null),
     toolFormat: normalizeString(llmRaw.tool_format, { allowEmpty: true }) || 'tools', // tools|functions
     timeoutMs: parseIntLike(llmRaw.timeout_ms, 120_000) ?? 120_000,
+    responseFormat: llmResponseFormat,
+    extraBody: llmExtraBody,
   };
   if (!llm.baseUrl) throw new Error(`Missing llm.base_url in ${resolved}`);
   if (!llm.model) throw new Error(`Missing llm.model in ${resolved}`);
@@ -103,6 +112,7 @@ export function loadPromptSetupFromFile({ configPath = DEFAULT_PROMPT_SETUP_PATH
     auditDir: resolvePath(baseDir, serverRaw.audit_dir || 'onchain/prompt/audit'),
     autoApproveDefault: Boolean(serverRaw.auto_approve_default),
     maxSteps: parseIntLike(serverRaw.max_steps, 12) ?? 12,
+    maxRepairs: parseIntLike(serverRaw.max_repairs, 2) ?? 2,
   };
   if (!Number.isFinite(server.port) || server.port <= 0) throw new Error(`Invalid server.port in ${resolved}`);
 
@@ -149,6 +159,7 @@ export function loadPromptSetupFromFile({ configPath = DEFAULT_PROMPT_SETUP_PATH
 
   return {
     configPath: resolved,
+    agent,
     llm,
     server,
     scBridge,
@@ -157,4 +168,3 @@ export function loadPromptSetupFromFile({ configPath = DEFAULT_PROMPT_SETUP_PATH
     solana,
   };
 }
-

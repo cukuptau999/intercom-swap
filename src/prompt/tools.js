@@ -58,6 +58,46 @@ export const INTERCOMSWAP_TOOLS = [
   tool('intercomswap_sc_info', 'Get peer info via SC-Bridge (safe fields only).', emptyParams),
   tool('intercomswap_sc_stats', 'Get SC-Bridge stats.', emptyParams),
   tool('intercomswap_sc_price_get', 'Get latest price snapshot from local price feature/oracle.', emptyParams),
+  tool('intercomswap_sc_subscribe', 'Subscribe this prompt session to sidechannel message events for specific channels.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      channels: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 50,
+        items: channelParam,
+        description: 'Channels to receive events for.',
+      },
+    },
+    required: ['channels'],
+  }),
+  tool(
+    'intercomswap_sc_wait_envelope',
+    'Wait for the next signed swap envelope seen on subscribed sidechannels. Returns a handle to the full envelope.',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        channels: {
+          type: 'array',
+          minItems: 0,
+          maxItems: 50,
+          items: channelParam,
+          description: 'Optional channel allowlist. If omitted/empty, any subscribed channel is accepted.',
+        },
+        kinds: {
+          type: 'array',
+          minItems: 0,
+          maxItems: 20,
+          items: { type: 'string', minLength: 1, maxLength: 64 },
+          description: 'Optional swap envelope kind allowlist (e.g. swap.rfq, swap.quote, swap.swap_invite).',
+        },
+        timeout_ms: { type: 'integer', minimum: 10, maximum: 120000, description: 'Long-poll timeout in ms.' },
+      },
+      required: [],
+    }
+  ),
   tool('intercomswap_sc_join', 'Join a sidechannel (invite/welcome optional).', {
     type: 'object',
     additionalProperties: false,
@@ -117,7 +157,10 @@ export const INTERCOMSWAP_TOOLS = [
     },
     required: ['channel', 'trade_id', 'btc_sats', 'usdt_amount'],
   }),
-  tool('intercomswap_quote_post', 'Post a signed QUOTE envelope into an RFQ channel (references an RFQ id).', {
+  tool(
+    'intercomswap_quote_post',
+    'Post a signed QUOTE envelope into an RFQ channel (references an RFQ id). Provide either valid_until_unix or valid_for_sec.',
+    {
     type: 'object',
     additionalProperties: false,
     properties: {
@@ -127,15 +170,42 @@ export const INTERCOMSWAP_TOOLS = [
       btc_sats: satsParam,
       usdt_amount: atomicAmountParam,
       valid_until_unix: unixSecParam,
+      valid_for_sec: { type: 'integer', minimum: 10, maximum: 60 * 60 * 24 * 7 },
     },
-    required: ['channel', 'trade_id', 'rfq_id', 'btc_sats', 'usdt_amount', 'valid_until_unix'],
-  }),
+    required: ['channel', 'trade_id', 'rfq_id', 'btc_sats', 'usdt_amount'],
+  }
+  ),
+  tool(
+    'intercomswap_quote_post_from_rfq',
+    'Maker: post a signed QUOTE that matches an RFQ envelope (no manual rfq_id/btc_sats/usdt_amount required). Provide either valid_until_unix or valid_for_sec.',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        channel: channelParam,
+        rfq_envelope: {
+          anyOf: [
+            { type: 'object', description: 'Full signed RFQ envelope received from the network.' },
+            { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to an RFQ envelope.' },
+          ],
+        },
+        valid_until_unix: unixSecParam,
+        valid_for_sec: { type: 'integer', minimum: 10, maximum: 60 * 60 * 24 * 7 },
+      },
+      required: ['channel', 'rfq_envelope'],
+    }
+  ),
   tool('intercomswap_quote_accept', 'Post a signed QUOTE_ACCEPT envelope into the RFQ channel (accept a quote).', {
     type: 'object',
     additionalProperties: false,
     properties: {
       channel: channelParam,
-      quote_envelope: { type: 'object', description: 'Full signed quote envelope received from the network.' },
+      quote_envelope: {
+        anyOf: [
+          { type: 'object', description: 'Full signed quote envelope received from the network.' },
+          { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to a quote envelope.' },
+        ],
+      },
     },
     required: ['channel', 'quote_envelope'],
   }),
@@ -147,7 +217,12 @@ export const INTERCOMSWAP_TOOLS = [
       additionalProperties: false,
       properties: {
         channel: channelParam,
-        accept_envelope: { type: 'object', description: 'Full signed QUOTE_ACCEPT envelope received from the network.' },
+        accept_envelope: {
+          anyOf: [
+            { type: 'object', description: 'Full signed QUOTE_ACCEPT envelope received from the network.' },
+            { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to an accept envelope.' },
+          ],
+        },
         swap_channel: { ...channelParam, description: 'Optional explicit swap:<id> channel name. If omitted, derived.' },
         welcome_text: { type: 'string', minLength: 1, maxLength: 500 },
         ttl_sec: { type: 'integer', minimum: 30, maximum: 60 * 60 * 24 * 7 },
@@ -159,7 +234,12 @@ export const INTERCOMSWAP_TOOLS = [
     type: 'object',
     additionalProperties: false,
     properties: {
-      swap_invite_envelope: { type: 'object', description: 'Full signed SWAP_INVITE envelope received from maker.' },
+      swap_invite_envelope: {
+        anyOf: [
+          { type: 'object', description: 'Full signed SWAP_INVITE envelope received from maker.' },
+          { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to a swap invite envelope.' },
+        ],
+      },
     },
     required: ['swap_invite_envelope'],
   }),
@@ -275,6 +355,82 @@ export const INTERCOMSWAP_TOOLS = [
       payment_hash_hex: hex32Param,
     },
     required: ['payment_hash_hex'],
+  }),
+
+  // Swap settlement helpers (deterministic; sign + send swap envelopes).
+  tool('intercomswap_swap_ln_invoice_create_and_post', 'Maker: create an LN invoice and post LN_INVOICE into swap:<id>.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      channel: channelParam,
+      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+      btc_sats: satsParam,
+      label: { type: 'string', minLength: 1, maxLength: 120 },
+      description: { type: 'string', minLength: 1, maxLength: 500 },
+      expiry_sec: { type: 'integer', minimum: 60, maximum: 60 * 60 * 24 * 7 },
+    },
+    required: ['channel', 'trade_id', 'btc_sats', 'label', 'description'],
+  }),
+  tool(
+    'intercomswap_swap_sol_escrow_init_and_post',
+    'Maker: init Solana escrow and post SOL_ESCROW_CREATED into swap:<id>.',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        channel: channelParam,
+        trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+        payment_hash_hex: hex32Param,
+        mint: base58Param,
+        amount: atomicAmountParam,
+        recipient: base58Param,
+        refund: base58Param,
+        refund_after_unix: unixSecParam,
+        platform_fee_bps: { type: 'integer', minimum: 0, maximum: 500 },
+        trade_fee_bps: { type: 'integer', minimum: 0, maximum: 1000 },
+        trade_fee_collector: base58Param,
+      },
+      required: [
+        'channel',
+        'trade_id',
+        'payment_hash_hex',
+        'mint',
+        'amount',
+        'recipient',
+        'refund',
+        'refund_after_unix',
+        'platform_fee_bps',
+        'trade_fee_bps',
+        'trade_fee_collector',
+      ],
+    }
+  ),
+  tool('intercomswap_swap_ln_pay_and_post', 'Taker: pay the LN invoice and post LN_PAID into swap:<id>.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      channel: channelParam,
+      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+      bolt11: { type: 'string', minLength: 20, maxLength: 8000 },
+      payment_hash_hex: hex32Param,
+    },
+    required: ['channel', 'trade_id', 'bolt11', 'payment_hash_hex'],
+  }),
+  tool('intercomswap_swap_sol_claim_and_post', 'Taker: claim Solana escrow and post SOL_CLAIMED into swap:<id>.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      channel: channelParam,
+      trade_id: { type: 'string', minLength: 1, maxLength: 128 },
+      preimage_hex: {
+        anyOf: [
+          { type: 'string', minLength: 64, maxLength: 64, pattern: '^[0-9a-fA-F]{64}$' },
+          { type: 'string', minLength: 8, maxLength: 200, pattern: '^secret:[0-9a-fA-F-]+$' },
+        ],
+      },
+      mint: base58Param,
+    },
+    required: ['channel', 'trade_id', 'preimage_hex', 'mint'],
   }),
 
   // Solana escrow / program ops (executor must use configured RPC + keypairs).

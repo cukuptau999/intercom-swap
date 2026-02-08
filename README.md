@@ -75,7 +75,7 @@ Install this repo using SKILL.md. Run all tests (unit + e2e). Report what you ra
 
 2. Install + staging tests
 ```text
-Install this repo using SKILL.md. Run unit + local e2e. Then run a smoke test on test networks (LN signet + Solana devnet) if supported. Report results.
+Install this repo using SKILL.md. Run unit + local e2e. Then run a smoke test on test networks (LN regtest + Solana devnet) if supported. Report results.
 ```
 
 3. Update workflow

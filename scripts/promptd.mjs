@@ -92,6 +92,10 @@ async function main() {
     process.stdout.write(
       `${JSON.stringify(
         {
+          agent: {
+            // "maker" or "taker" (used only for system prompt guidance; does not grant permissions).
+            role: 'maker',
+          },
           llm: {
             base_url: 'http://127.0.0.1:8000/v1',
             api_key: '',
@@ -104,6 +108,11 @@ async function main() {
             repetition_penalty: 1.1,
             tool_format: 'tools',
             timeout_ms: 120000,
+            // Optional: OpenAI-style structured output enforcement:
+            // { "type": "json_object" } or { "type": "json_schema", "json_schema": { ... } }
+            response_format: { type: 'json_object' },
+            // Optional: extra, provider-specific body fields (pass-through).
+            extra_body: {},
           },
           server: {
             host: '127.0.0.1',
@@ -111,6 +120,9 @@ async function main() {
             audit_dir: 'onchain/prompt/audit',
             auto_approve_default: false,
             max_steps: 12,
+            // If the model returns invalid structured output (eg, plans instead of tool calls),
+            // promptd will ask it to re-emit valid JSON up to this many times.
+            max_repairs: 2,
           },
           sc_bridge: {
             url: 'ws://127.0.0.1:49222',
@@ -160,6 +172,8 @@ async function main() {
     toolExecutor: executor,
     auditDir: setup.server.auditDir,
     maxSteps: setup.server.maxSteps,
+    maxRepairs: setup.server.maxRepairs,
+    agentRole: setup.agent?.role || '',
   });
 
   const server = http.createServer(async (req, res) => {
