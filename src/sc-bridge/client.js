@@ -11,6 +11,25 @@ export class ScBridgeClient extends EventEmitter {
     this._nextId = 1;
   }
 
+  _rejectAllPending(err) {
+    const error = err instanceof Error ? err : new Error(String(err || 'SC-Bridge error'));
+    for (const [id, pending] of this._pending.entries()) {
+      try {
+        pending.reject(error);
+      } catch (_e) {}
+      this._pending.delete(id);
+    }
+  }
+
+  _resetConnection(err) {
+    // Ensure callers can reconnect by clearing ws, and never leave RPC promises hanging.
+    this._rejectAllPending(err || new Error('SC-Bridge closed'));
+    try {
+      if (this.ws) this.ws.onopen = this.ws.onerror = this.ws.onmessage = this.ws.onclose = null;
+    } catch (_e) {}
+    this.ws = null;
+  }
+
   async connect({ timeoutMs = 10_000 } = {}) {
     if (this.ws) throw new Error('Already connected');
 
@@ -22,6 +41,7 @@ export class ScBridgeClient extends EventEmitter {
       ws.onopen = () => {};
       ws.onerror = (evt) => {
         clearTimeout(timer);
+        this._resetConnection(new Error(evt?.message || 'SC-Bridge socket error'));
         reject(new Error(evt?.message || 'SC-Bridge socket error'));
       };
       ws.onmessage = (evt) => {
@@ -38,6 +58,7 @@ export class ScBridgeClient extends EventEmitter {
             ws.send(JSON.stringify({ type: 'auth', token: this.token }));
           } else if (msg.requiresAuth && !this.token) {
             clearTimeout(timer);
+            this._resetConnection(new Error('SC-Bridge requires auth but no token provided'));
             reject(new Error('SC-Bridge requires auth but no token provided'));
           } else {
             clearTimeout(timer);
@@ -52,16 +73,29 @@ export class ScBridgeClient extends EventEmitter {
         }
         if (msg.type === 'error' && msg.error === 'Unauthorized.') {
           clearTimeout(timer);
+          this._resetConnection(new Error('SC-Bridge unauthorized'));
           reject(new Error('SC-Bridge unauthorized'));
         }
       };
       ws.onclose = () => {
         clearTimeout(timer);
+        this._resetConnection(new Error('SC-Bridge closed before ready'));
         reject(new Error('SC-Bridge closed before ready'));
       };
     });
 
     await ready;
+
+    // After ready, keep the client reconnectable and never leave pending RPCs hanging.
+    ws.onclose = () => {
+      this._resetConnection(new Error('SC-Bridge closed'));
+      this.emit('close');
+    };
+    ws.onerror = (evt) => {
+      // Keep the connection reset behavior consistent with onclose; callers will reconnect.
+      this._resetConnection(new Error(evt?.message || 'SC-Bridge socket error'));
+      this.emit('close');
+    };
   }
 
   close() {
@@ -69,7 +103,7 @@ export class ScBridgeClient extends EventEmitter {
     try {
       this.ws.close();
     } catch (_e) {}
-    this.ws = null;
+    this._resetConnection(new Error('SC-Bridge closed'));
   }
 
   _rpc(type, payload) {
@@ -78,7 +112,14 @@ export class ScBridgeClient extends EventEmitter {
     const msg = { id, type, ...payload };
     return new Promise((resolve, reject) => {
       this._pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify(msg));
+      try {
+        this.ws.send(JSON.stringify(msg));
+      } catch (err) {
+        // If the websocket died, fail fast. Otherwise callers can hang forever.
+        this._pending.delete(id);
+        this._resetConnection(err);
+        reject(err);
+      }
       // Rely on caller timeouts for now.
     });
   }

@@ -71,6 +71,9 @@ function App() {
       return false;
     }
   });
+  // Used for expiry-based UI (invites, etc.). Without this, useMemo() caching can prevent items
+  // from ever transitioning into "expired" if no new events arrive.
+  const [uiNowMs, setUiNowMs] = useState<number>(() => Date.now());
   const [dismissedInviteTradeIds, setDismissedInviteTradeIds] = useState<Record<string, number>>(() => {
     try {
       const raw = String(window.localStorage.getItem('collin_dismissed_invites') || '').trim();
@@ -652,7 +655,7 @@ function App() {
   }, [promptEvents, scEvents, localPeerPubkeyHex]);
 
   const inviteEvents = useMemo(() => {
-    const now = Date.now();
+    const now = uiNowMs;
     const out: any[] = [];
     const seen = new Set<string>();
     for (const e of filteredScEvents) {
@@ -662,12 +665,7 @@ function App() {
         const tradeId = String(msg?.trade_id || (e as any)?.trade_id || '').trim();
         const swapCh = String(msg?.body?.swap_channel || '').trim();
         const expiresAtRaw = msg?.body?.invite?.payload?.expiresAt;
-        const expiresAtMs =
-          typeof expiresAtRaw === 'number'
-            ? expiresAtRaw
-            : typeof expiresAtRaw === 'string' && /^[0-9]+$/.test(expiresAtRaw.trim())
-              ? Number.parseInt(expiresAtRaw.trim(), 10)
-              : null;
+        const expiresAtMs = epochToMs(expiresAtRaw);
         const expired = expiresAtMs && Number.isFinite(expiresAtMs) && expiresAtMs > 0 ? now > expiresAtMs : false;
         if (expired && !showExpiredInvites) continue;
         if (tradeId && dismissedInviteTradeIds && dismissedInviteTradeIds[tradeId] && !showDismissedInvites) continue;
@@ -679,7 +677,7 @@ function App() {
       } catch (_e) {}
     }
     return out;
-  }, [filteredScEvents, showExpiredInvites, dismissedInviteTradeIds, showDismissedInvites]);
+  }, [filteredScEvents, showExpiredInvites, dismissedInviteTradeIds, showDismissedInvites, uiNowMs]);
 
   const knownChannels = useMemo(() => {
     const set = new Set<string>();
@@ -714,6 +712,57 @@ function App() {
     for (const c of scChannels.split(',').map((s) => s.trim()).filter(Boolean)) set.add(c);
     return set;
   }, [scChannels]);
+
+  // Auto-hygiene: if a swap invite expires and we're still joined to its swap channel, leave automatically.
+  // This keeps peers from "sitting" in dead swap:* channels forever (and reduces confusion in Invites).
+  const autoLeftSwapChRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!health?.ok) return;
+    if (!joinedChannels || joinedChannels.length === 0) return;
+    const joinedSet = new Set(joinedChannels);
+    const now = uiNowMs;
+
+    const candidates: Array<{ swapCh: string; tradeId: string; expiresAtMs: number }> = [];
+    for (const e of filteredScEvents) {
+      try {
+        if (String((e as any)?.kind || '') !== 'swap.swap_invite') continue;
+        const msg = (e as any)?.message;
+        const tradeId = String(msg?.trade_id || (e as any)?.trade_id || '').trim();
+        const swapCh = String(msg?.body?.swap_channel || '').trim();
+        if (!swapCh || !swapCh.startsWith('swap:')) continue;
+        if (!joinedSet.has(swapCh)) continue;
+        if (autoLeftSwapChRef.current.has(swapCh)) continue;
+        const expiresAtMs = epochToMs(msg?.body?.invite?.payload?.expiresAt);
+        if (!expiresAtMs || !Number.isFinite(expiresAtMs) || expiresAtMs < 1) continue;
+        if (now <= expiresAtMs) continue;
+        candidates.push({ swapCh, tradeId, expiresAtMs });
+      } catch (_e) {}
+    }
+    if (candidates.length === 0) return;
+    candidates.sort((a, b) => a.expiresAtMs - b.expiresAtMs);
+
+    let cancelled = false;
+    void (async () => {
+      for (const c of candidates.slice(0, 5)) {
+        if (cancelled) return;
+        autoLeftSwapChRef.current.add(c.swapCh);
+        try {
+          await runToolFinal('intercomswap_sc_leave', { channel: c.swapCh }, { auto_approve: true });
+          if (watchedChannelsSet.has(c.swapCh)) unwatchChannel(c.swapCh);
+          if (c.tradeId) dismissInviteTrade(c.tradeId);
+          pushToast('info', `Auto-left expired swap channel: ${c.swapCh}`, { ttlMs: 6_000 });
+          void refreshPreflight();
+        } catch (_err) {
+          // If leave fails (peer down), allow retry later.
+          autoLeftSwapChRef.current.delete(c.swapCh);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [health?.ok, joinedChannels, filteredScEvents, uiNowMs, watchedChannelsSet]);
 
   function dismissInviteTrade(tradeIdRaw: string) {
     const tradeId = String(tradeIdRaw || '').trim();
@@ -2568,6 +2617,12 @@ function App() {
     const t = setInterval(refreshHealth, 5000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep uiNowMs ticking so expiry-based UI stays correct even if the network is quiet.
+  useEffect(() => {
+    const t = setInterval(() => setUiNowMs(Date.now()), 15_000);
+    return () => clearInterval(t);
   }, []);
 
   // Stack observer:
@@ -5465,6 +5520,19 @@ function msToUtcIso(ms: number) {
   }
 }
 
+function epochToMs(raw: any): number | null {
+  // Accept seconds or milliseconds (number or numeric-string) and normalize to milliseconds.
+  const n =
+    typeof raw === 'number'
+      ? raw
+      : typeof raw === 'string' && /^[0-9]+$/.test(raw.trim())
+        ? Number.parseInt(raw.trim(), 10)
+        : null;
+  if (typeof n !== 'number' || !Number.isFinite(n) || n < 1) return null;
+  // Heuristic: < 1e12 is almost certainly seconds since epoch; >= 1e12 is ms.
+  return n < 1e12 ? Math.trunc(n) * 1000 : Math.trunc(n);
+}
+
 function unixSecToUtcIso(sec: number) {
   if (!Number.isFinite(sec) || sec < 1) return '';
   return msToUtcIso(Math.trunc(sec) * 1000);
@@ -6526,9 +6594,7 @@ function InviteRow({
   const expiresAtMs =
     typeof evt?._invite_expires_at_ms === 'number'
       ? (evt._invite_expires_at_ms as number)
-      : typeof body?.invite?.payload?.expiresAt === 'number'
-        ? (body.invite.payload.expiresAt as number)
-        : null;
+      : epochToMs(body?.invite?.payload?.expiresAt);
   const expired = Boolean(evt?._invite_expired);
   const expIso = expiresAtMs ? msToUtcIso(expiresAtMs) : '';
 

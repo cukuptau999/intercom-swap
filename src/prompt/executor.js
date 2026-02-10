@@ -607,7 +607,15 @@ export class ToolExecutor {
   }
 
   async _scEnsurePersistent({ timeoutMs = 10_000 } = {}) {
-    if (this._sc && this._sc.ws) return this._sc;
+    const wsLooksOpen = (ws) => Boolean(ws && typeof ws.readyState === 'number' && ws.readyState === 1);
+    if (this._sc && this._sc.ws && wsLooksOpen(this._sc.ws)) return this._sc;
+    // Peer restarts can leave a stale ws object behind. If it isn't OPEN, force a reconnect.
+    if (this._sc && this._sc.ws && !wsLooksOpen(this._sc.ws)) {
+      try {
+        this._sc.close();
+      } catch (_e) {}
+      this._sc = null;
+    }
     if (this._scConnecting) return this._scConnecting;
 
     this._scConnecting = (async () => {
@@ -618,6 +626,10 @@ export class ToolExecutor {
         try {
           this._onScEvent(msg);
         } catch (_e) {}
+      });
+      sc.on('close', () => {
+        // Mark stale; next scEnsureConnected() will reconnect.
+        if (this._sc === sc) this._sc = null;
       });
 
       // Re-apply subscriptions on reconnect.
