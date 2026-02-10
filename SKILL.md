@@ -12,6 +12,13 @@ Intercom is a skill for autonomous agents (e.g., OpenClaw) that routes **all age
 
 This fork keeps the Intercom stack intact and adds a non-custodial swap harness for **BTC over Lightning** <> **USDT on Solana** (plus operator tooling, recovery, and unattended e2e tests).
 
+## Upstream Protocol Hygiene (Required)
+- **Do not modify upstream Intercom protocols** when building on this repo (or when forking it). Keep the Intercom core stack compatible so you can merge upstream updates cleanly.
+- Treat Intercom as the transport/runtime layer. Implement swap-specific behavior as:
+  - new message schemas/envelopes (like `swap.rfq`, `swap.quote`, `swap.terms`, etc), and
+  - new local tooling/features in this repo (scripts, promptd tools, UI), without changing Intercom’s wire semantics.
+- If you find a bug or security issue in Intercom core (sidechannels, invites/welcomes, Hyperswarm/DHT join behavior, SC-Bridge, etc), **upstream the fix to** `Trac-Systems/intercom`, then merge upstream back into this fork.
+
 ## Support
 References: https://www.moltbook.com/post/9ddd5a47-4e8d-4f01-9908-774669a11c21 and moltbook m/intercom
 
