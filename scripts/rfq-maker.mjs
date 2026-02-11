@@ -14,7 +14,6 @@ import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from '../src/protocol/signedMessage.js';
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
-import { PAIR as PRICE_PAIR } from '../src/price/providers.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { deriveIntercomswapAppHash } from '../src/swap/app.js';
@@ -85,12 +84,6 @@ function parseIntFlag(value, label, fallback = null) {
   return n;
 }
 
-function parseBps(value, label, fallback) {
-  const n = parseIntFlag(value, label, fallback);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(0, Math.min(10_000, n));
-}
-
 function stripSignature(envelope) {
   if (!envelope || typeof envelope !== 'object') return envelope;
   const { sig: _sig, signer: _signer, ...unsigned } = envelope;
@@ -109,35 +102,6 @@ function signSwapEnvelope(unsignedEnvelope, { pubHex, secHex }) {
   const v = validateSwapEnvelope(signed);
   if (!v.ok) throw new Error(`Internal error: signed envelope invalid: ${v.error}`);
   return signed;
-}
-
-function quoteUsdtAmountFromOracle({ btcSats, priceUsdtPerBtc, usdtDecimals, spreadBps = 0 }) {
-  const sats = BigInt(String(btcSats));
-  const decimals = BigInt(String(usdtDecimals));
-  const scale = 10n ** decimals;
-  const priceMicro = BigInt(Math.round(Number(priceUsdtPerBtc) * 1_000_000));
-  if (priceMicro <= 0n) return null;
-
-  const denom = 100000000n * 1000000n;
-  let amount = (sats * priceMicro * scale) / denom;
-  const bps = BigInt(Math.max(0, Math.min(10_000, Number(spreadBps) || 0)));
-  if (bps > 0n) amount = (amount * (10000n - bps)) / 10000n;
-  if (amount < 0n) amount = 0n;
-  return amount.toString();
-}
-
-function impliedPriceUsdtPerBtc({ btcSats, usdtAmount, usdtDecimals }) {
-  try {
-    const sats = BigInt(String(btcSats));
-    const amt = BigInt(String(usdtAmount));
-    const denom = sats * (10n ** BigInt(String(usdtDecimals)));
-    if (sats <= 0n || denom <= 0n) return null;
-    // Return a micro-precision float: (amt * 1e8 / (sats * 10^dec)) rounded down to 1e-6.
-    const priceMicro = (amt * 100000000n * 1000000n) / denom;
-    return Number(priceMicro) / 1_000_000;
-  } catch (_e) {
-    return null;
-  }
 }
 
 function normalizeAmountString(value) {
@@ -191,11 +155,6 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 750);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
-
-  const priceGuard = parseBool(flags.get('price-guard'), true);
-  const priceMaxAgeMs = parseIntFlag(flags.get('price-max-age-ms'), 'price-max-age-ms', 15_000);
-  const makerSpreadBps = parseBps(flags.get('maker-spread-bps'), 'maker-spread-bps', 0);
-  const makerMaxOverpayBps = parseBps(flags.get('maker-max-overpay-bps'), 'maker-max-overpay-bps', 0);
 
   const receiptsDbPath = flags.get('receipts-db') ? String(flags.get('receipts-db')).trim() : '';
 
@@ -329,26 +288,6 @@ async function main() {
       }
     }
   }, 5_000);
-
-  const fetchBtcUsdtMedian = async () => {
-    const res = await sc.priceGet();
-    if (!res || typeof res !== 'object') return { ok: false, error: 'price_get failed (no response)', median: null };
-    if (res.type === 'error') return { ok: false, error: String(res.error || 'price_get error'), median: null };
-    if (res.type !== 'price_snapshot') return { ok: false, error: `unexpected price_get response: ${res.type}`, median: null };
-    const snap = res;
-    if (Number.isFinite(priceMaxAgeMs) && priceMaxAgeMs > 0) {
-      const age = Date.now() - Number(snap.ts || 0);
-      if (!Number.isFinite(age) || age > priceMaxAgeMs) {
-        return { ok: false, error: `price snapshot stale (ageMs=${age})`, median: null };
-      }
-    }
-    const feed = snap?.pairs?.[PRICE_PAIR.BTC_USDT];
-    const median = Number(feed?.median);
-    if (!feed?.ok || !Number.isFinite(median) || median <= 0) {
-      return { ok: false, error: feed?.error || 'btc_usdt median unavailable', median: null };
-    }
-    return { ok: true, error: null, median };
-  };
 
   const persistTrade = (tradeId, patch, eventKind = null, eventPayload = null) => {
     if (!receipts) return;
@@ -864,53 +803,14 @@ async function main() {
 
         let quoteUsdtAmount = String(msg.body.usdt_amount || '').trim();
         if (!quoteUsdtAmount) quoteUsdtAmount = '0';
-        if (priceGuard) {
-          // Informative oracle mode for fixed-price RFQs:
-          // - If usdt_amount is set by requester, keep that price and only log advisory.
-          // - If usdt_amount is open/zero, derive the quote from oracle.
-          const rfqAmountTrimmed = String(quoteUsdtAmount).trim();
-          const rfqIsOpen = rfqAmountTrimmed === '' || rfqAmountTrimmed === '0';
-          const px = await fetchBtcUsdtMedian();
-
-          if (rfqIsOpen) {
-            if (!px.ok) {
-              if (debug) process.stderr.write(`[maker] skip rfq open amount: oracle unavailable (${px.error})\n`);
-              return;
-            }
-            const oracleAmount = quoteUsdtAmountFromOracle({
-              btcSats: msg.body.btc_sats,
-              priceUsdtPerBtc: px.median,
-              usdtDecimals: solDecimals,
-              spreadBps: makerSpreadBps,
-            });
-            if (!oracleAmount || oracleAmount === '0') {
-              if (debug) process.stderr.write('[maker] skip rfq open amount: computed usdt_amount invalid\n');
-              return;
-            }
-            quoteUsdtAmount = oracleAmount;
-          } else {
-            quoteUsdtAmount = rfqAmountTrimmed;
-            if (px.ok) {
-              const rfqPrice = impliedPriceUsdtPerBtc({
-                btcSats: msg.body.btc_sats,
-                usdtAmount: rfqAmountTrimmed,
-                usdtDecimals: solDecimals,
-              });
-              if (rfqPrice !== null && Number.isFinite(rfqPrice) && rfqPrice > 0) {
-                const overpayBps = ((rfqPrice / px.median) - 1) * 10_000;
-                if (Number.isFinite(overpayBps) && overpayBps > makerMaxOverpayBps && debug) {
-                  process.stderr.write(
-                    `[maker] price guard advisory: rfq price over oracle by ${Math.round(overpayBps)} bps (trade_id=${msg.trade_id})\n`
-                  );
-                }
-              }
-            } else if (debug) {
-              process.stderr.write(`[maker] price guard advisory unavailable: ${px.error}\n`);
-            }
-          }
-        } else {
-          // If no price guard is enabled, avoid quoting nonsensical "open RFQ" amounts.
-          if (String(quoteUsdtAmount).trim() === '0') return;
+        if (!/^[0-9]+$/.test(quoteUsdtAmount)) {
+          if (debug) process.stderr.write(`[maker] skip rfq invalid usdt_amount trade_id=${msg.trade_id}\n`);
+          return;
+        }
+        if (quoteUsdtAmount === '0') {
+          // Negotiated flow requires explicit amounts; no oracle-priced/open RFQs.
+          if (debug) process.stderr.write(`[maker] skip rfq open amount unsupported trade_id=${msg.trade_id}\n`);
+          return;
         }
 
         // Quote at chosen terms.

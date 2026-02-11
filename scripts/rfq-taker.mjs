@@ -16,7 +16,6 @@ import {
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature, signUnsignedEnvelopeHex } from '../src/protocol/signedMessage.js';
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
-import { PAIR as PRICE_PAIR } from '../src/price/providers.js';
 import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { deriveIntercomswapAppHash } from '../src/swap/app.js';
@@ -127,20 +126,6 @@ function asBigIntAmount(value) {
   }
 }
 
-function impliedPriceUsdtPerBtc({ btcSats, usdtAmount, usdtDecimals }) {
-  try {
-    const sats = BigInt(String(btcSats));
-    const amt = BigInt(String(usdtAmount));
-    const denom = sats * (10n ** BigInt(String(usdtDecimals)));
-    if (sats <= 0n || denom <= 0n) return null;
-    // Return a micro-precision float: (amt * 1e8 / (sats * 10^dec)) rounded down to 1e-6.
-    const priceMicro = (amt * 100000000n * 1000000n) / denom;
-    return Number(priceMicro) / 1_000_000;
-  } catch (_e) {
-    return null;
-  }
-}
-
 async function sendAndConfirm(connection, tx) {
   const sig = await connection.sendRawTransaction(tx.serialize());
   const conf = await connection.confirmTransaction(sig, 'confirmed');
@@ -181,10 +166,6 @@ async function main() {
   const onceExitDelayMs = parseIntFlag(flags.get('once-exit-delay-ms'), 'once-exit-delay-ms', 200);
   const once = parseBool(flags.get('once'), false);
   const debug = parseBool(flags.get('debug'), false);
-
-  const priceGuard = parseBool(flags.get('price-guard'), true);
-  const priceMaxAgeMs = parseIntFlag(flags.get('price-max-age-ms'), 'price-max-age-ms', 15_000);
-  const takerMaxDiscountBps = parseBps(flags.get('taker-max-discount-bps'), 'taker-max-discount-bps', 200);
 
   const runSwap = parseBool(flags.get('run-swap'), false);
   const swapTimeoutSec = parseIntFlag(flags.get('swap-timeout-sec'), 'swap-timeout-sec', 300);
@@ -231,7 +212,6 @@ async function main() {
   const solRpcUrl = (flags.get('solana-rpc-url') && String(flags.get('solana-rpc-url')).trim()) || 'http://127.0.0.1:8899';
   const solKeypairPath = flags.get('solana-keypair') ? String(flags.get('solana-keypair')).trim() : '';
   const solMintStr = flags.get('solana-mint') ? String(flags.get('solana-mint')).trim() : '';
-  const solDecimals = parseIntFlag(flags.get('solana-decimals'), 'solana-decimals', 6);
   const solProgramIdStr = flags.get('solana-program-id') ? String(flags.get('solana-program-id')).trim() : '';
   const solComputeUnitLimit = parseIntFlag(flags.get('solana-cu-limit'), 'solana-cu-limit', null);
   const solComputeUnitPriceMicroLamports = parseIntFlag(flags.get('solana-cu-price'), 'solana-cu-price', null);
@@ -295,26 +275,6 @@ async function main() {
   if (signing.pubHex !== takerPubkey) {
     die(`peer keypair pubkey mismatch: sc_bridge=${takerPubkey} keypair=${signing.pubHex}`);
   }
-
-  const fetchBtcUsdtMedian = async () => {
-    const res = await sc.priceGet();
-    if (!res || typeof res !== 'object') return { ok: false, error: 'price_get failed (no response)', median: null };
-    if (res.type === 'error') return { ok: false, error: String(res.error || 'price_get error'), median: null };
-    if (res.type !== 'price_snapshot') return { ok: false, error: `unexpected price_get response: ${res.type}`, median: null };
-    const snap = res;
-    if (Number.isFinite(priceMaxAgeMs) && priceMaxAgeMs > 0) {
-      const age = Date.now() - Number(snap.ts || 0);
-      if (!Number.isFinite(age) || age > priceMaxAgeMs) {
-        return { ok: false, error: `price snapshot stale (ageMs=${age})`, median: null };
-      }
-    }
-    const feed = snap?.pairs?.[PRICE_PAIR.BTC_USDT];
-    const median = Number(feed?.median);
-    if (!feed?.ok || !Number.isFinite(median) || median <= 0) {
-      return { ok: false, error: feed?.error || 'btc_usdt median unavailable', median: null };
-    }
-    return { ok: true, error: null, median };
-  };
 
   const persistTrade = (patch, eventKind = null, eventPayload = null) => {
     if (!receipts) return;
@@ -399,6 +359,7 @@ async function main() {
             if (!Number.isInteger(btc) || btc < 1) continue;
             const usdt = String(o.usdt_amount || '').trim();
             if (!/^[0-9]+$/.test(usdt)) continue;
+            if (BigInt(usdt) <= 0n) continue;
 
             const maxPlat = Number(o.max_platform_fee_bps);
             const maxTrade = Number(o.max_trade_fee_bps);
@@ -468,6 +429,12 @@ async function main() {
   let rfqValidUntil = nowSec + rfqValidSec;
   if (offerMeta && Number.isFinite(offerMeta.offer_valid_until_unix) && offerMeta.offer_valid_until_unix > 0) {
     rfqValidUntil = Math.min(rfqValidUntil, Math.trunc(offerMeta.offer_valid_until_unix));
+  }
+  if (!Number.isInteger(Number(btcSats)) || Number(btcSats) < 1) {
+    die('Invalid --btc-sats (must be >= 1)');
+  }
+  if (!/^[0-9]+$/.test(String(usdtAmount || '').trim()) || BigInt(String(usdtAmount || '0')) <= 0n) {
+    die('Invalid --usdt-amount (must be a positive base-unit integer; open RFQ amount=0 is not supported)');
   }
   const rfqUnsigned = createUnsignedEnvelope({
     v: 1,
@@ -923,23 +890,6 @@ async function main() {
       }
     }
 
-    if (priceGuard) {
-      const px = await fetchBtcUsdtMedian();
-      if (!px.ok) throw new Error(`price guard failed: ${px.error}`);
-      const implied = impliedPriceUsdtPerBtc({
-        btcSats: swapCtx.trade.terms.btc_sats,
-        usdtAmount: swapCtx.trade.terms.usdt_amount,
-        usdtDecimals: solDecimals,
-      });
-      if (implied === null || !Number.isFinite(implied) || implied <= 0) {
-        throw new Error('price guard failed: implied price unavailable');
-      }
-      const discountBps = ((1 - (implied / px.median)) * 10_000);
-      if (Number.isFinite(discountBps) && discountBps > takerMaxDiscountBps) {
-        throw new Error(`price guard failed: discount_bps=${discountBps.toFixed(1)} max=${takerMaxDiscountBps}`);
-      }
-    }
-
     // Pay LN invoice and obtain preimage.
     const payRes = await lnPay(ln, { bolt11: swapCtx.trade.invoice.bolt11 });
     const preimageHex = String(payRes?.payment_preimage || '').trim().toLowerCase();
@@ -1120,25 +1070,6 @@ async function main() {
           // Guardrail: treat RFQ usdt_amount as a minimum when set (>0).
           const rfqMin = asBigIntAmount(usdtAmount) ?? 0n;
           if (rfqMin > 0n && quoteAmount < rfqMin) return;
-
-          // Guardrail: if enabled, require oracle health + acceptable discount vs oracle price.
-          if (priceGuard) {
-            const px = await fetchBtcUsdtMedian();
-            if (!px.ok) return;
-            const implied = impliedPriceUsdtPerBtc({
-              btcSats: msg.body.btc_sats,
-              usdtAmount: quoteAmountStr,
-              usdtDecimals: solDecimals,
-            });
-            if (implied === null || !Number.isFinite(implied) || implied <= 0) return;
-            const discountBps = ((1 - (implied / px.median)) * 10_000);
-            if (Number.isFinite(discountBps) && discountBps > takerMaxDiscountBps) {
-              if (debug) {
-                process.stderr.write(`[taker] reject quote (discount_bps=${discountBps.toFixed(1)} > max=${takerMaxDiscountBps}) quote_id=${quoteId}\n`);
-              }
-              return;
-            }
-          }
 
           chosen = { rfq_id: rfqId, quote_id: quoteId, quote: msg };
           const quoteAcceptUnsigned = createUnsignedEnvelope({

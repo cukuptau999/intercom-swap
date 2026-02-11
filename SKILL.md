@@ -1327,17 +1327,10 @@ SC-Bridge RPC:
 - `price_get` returns the latest `price_snapshot`.
 - Clients: `ScBridgeClient.priceGet()`.
 
-Bot guardrails (defaults are fail-closed):
-- Maker: `scripts/rfq-maker.mjs`
-  - `--price-guard 0|1` (default `1`)
-  - `--price-max-age-ms <ms>` (default `15000`)
-  - `--maker-spread-bps <bps>` (default `0`): counterquote discount vs oracle price
-  - `--maker-max-overpay-bps <bps>` (default `0`): if RFQ implies a price above oracle by more than this, maker counterquotes instead of echoing the RFQ
-- Taker: `scripts/rfq-taker.mjs`
-  - `--price-guard 0|1` (default `1`)
-  - `--price-max-age-ms <ms>` (default `15000`)
-  - `--taker-max-discount-bps <bps>` (default `200`): reject quotes and abort before LN pay if implied price is below oracle by more than this
-  - `--solana-decimals <n>` (default `6`): used only for implied-price calculations
+Bot pricing policy (current):
+- Price is negotiated strictly by RFQ/Offer terms (`btc_sats`, `usdt_amount`).
+- Oracle snapshots are informational only (UI/operator awareness), not quote/settlement gates.
+- Open RFQs are not supported in bot flow (`usdt_amount` must be a positive base-unit integer).
 
 ### Receipts + Recovery (Mandatory)
 Swaps require a local-only recovery path in case an agent crashes mid-trade.

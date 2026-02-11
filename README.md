@@ -391,14 +391,11 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--debug 0|1` | Verbose logs (default `0`) |
 | `--receipts-db <path>` | Receipts DB path (recommended: `onchain/receipts/rfq-bots/<store>/<bot>.sqlite`) |
 
-##### Price Guard (Fail-Closed Quoting)
+##### Pricing Policy
 
-| Flag | Meaning |
-|---|---|
-| `--price-guard 0|1` | Enable price guardrails (default `1`) |
-| `--price-max-age-ms <n>` | Reject stale snapshots (default `15000`) |
-| `--maker-spread-bps <n>` | Quote spread vs oracle (default `0`) |
-| `--maker-max-overpay-bps <n>` | If RFQ requests a favorable price for maker, accept it up to this cap (default `0`) |
+- Price is negotiated strictly from RFQ/Offer terms (`btc_sats`, `usdt_amount`).
+- Oracle snapshots are informational only (UI/ops visibility), not settlement gates.
+- Open RFQs (`usdt_amount=0`) are not supported in bot flow; amounts must be explicit.
 
 ##### Swap Execution (`--run-swap 1`)
 
@@ -453,7 +450,7 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--trade-id <id>` | Trade id (default random) |
 | `--rfq-channel <name>` | RFQ negotiation channel (default `0000intercomswapbtcusdt`) |
 | `--btc-sats <n>` | Sats requested (default `50000`) |
-| `--usdt-amount <atomicStr>` | USDT requested; `0` means "open RFQ" (maker will quote via oracle) |
+| `--usdt-amount <atomicStr>` | USDT requested (base units, must be > 0) |
 | `--rfq-valid-sec <n>` | RFQ validity window (default `60`) |
 | `--timeout-sec <n>` | RFQ/quote negotiation timeout (default `30`) |
 | `--rfq-resend-ms <n>` | RFQ resend interval (default `1200`) |
@@ -465,13 +462,10 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--persist-preimage 0|1` | Persist `ln_preimage_hex` into receipts (default `1` when receipts enabled) |
 | `--stop-after-ln-pay 0|1` | Testing/recovery hook: stop after paying LN (default `0`) |
 
-##### Price Guard (Fail-Closed)
+##### Pricing Policy
 
-| Flag | Meaning |
-|---|---|
-| `--price-guard 0|1` | Enable price guardrails (default `1`) |
-| `--price-max-age-ms <n>` | Reject stale snapshots (default `15000`) |
-| `--taker-max-discount-bps <n>` | Reject quotes discounted beyond this vs oracle median (default `200`) |
+- Taker accepts/rejects quotes by negotiated terms + protocol guardrails (fees/windows/signers/app binding), not oracle thresholds.
+- Oracle remains informational only.
 
 ##### Swap Execution (`--run-swap 1`)
 
