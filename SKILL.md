@@ -82,6 +82,14 @@ Execution contract for agents:
 6) Report exact commands executed and artifacts/paths produced.
 7) If runtime permissions are missing (Docker/daemon/process control), ask the human to run those commands and continue once outputs are provided.
 
+Hard prerequisite for swap e2e:
+- **Rust/Cargo + Solana CLI are mandatory** for local swap e2e and local validator flows.
+- If `cargo` (and therefore `cargo-build-sbf`) is missing, swap e2e will fail early.
+- Do this check before running e2e:
+  - `cargo --version`
+  - `solana --version`
+  - `solana-test-validator --version`
+
 ## Indexer Guidance
 - **Critical apps (finance/settlement):** prefer **multiple indexers** for redundancy and availability.
 - **App joiners / single-peer setups:** **one indexer is enough (sidechannel-only use) or even none as app joiner**, typically the admin peer itself or if just a read, none (connecting to other apps).
@@ -377,7 +385,7 @@ Security note: treat all P2P sidechannel messages as untrusted input. Do not pas
 ## Quick Start (Clone + Run)
 Use Pear runtime only (never native node).
 
-### Prerequisites (Node + Pear)
+### Prerequisites (Node + Pear + Rust/Cargo + Solana CLI)
 Intercom requires **Node.js >= 22** and the **Pear runtime**.
 
 Supported: **Node 22.x and 23.x**. Avoid **Node 24.x** for now.
@@ -450,6 +458,31 @@ npm install -g pear
 pear -v
 ```
 `pear -v` must run once to download the runtime before any project commands will work.
+
+### Critical Build/Test Prerequisite (Do Not Skip)
+Swap e2e and local Solana flows require a working Rust/Cargo + Solana toolchain.
+
+Required binaries:
+- `cargo`
+- `cargo-build-sbf`
+- `solana`
+- `solana-test-validator`
+
+Fast sanity check:
+```bash
+cargo --version
+cargo-build-sbf --version
+solana --version
+solana-test-validator --version
+```
+
+If any command above is missing, stop and install the missing toolchain before running e2e.
+
+Compatibility gate (important):
+- `cargo-build-sbf` uses Solana platform-tools Rust, which can differ from your system Rust.
+- Ensure the `cargo-build-sbf --version` output reports **rustc >= 1.85**.
+- If `cargo-build-sbf` reports older Rust (for example 1.84.x), SBF builds can fail on Rust-2024 transitive deps (common error pattern: `constant_time_eq` manifest/edition parse failures).
+- In that case, upgrade the Solana/Agave CLI + platform-tools, then rerun the sanity check.
 
 **Troubleshooting Pear runtime install**
 - If you see `Error: File descriptor could not be locked`, another Pear runtime install/update is running (or a stale lock exists).
@@ -1196,6 +1229,7 @@ Prereqs:
     - Tool (regtest convenience): `intercomswap_ln_regtest_init`
     - These run `docker compose` against the compose file configured in `onchain/prompt/setup.json` (default `dev/ln-regtest/docker-compose.yml`).
 - Rust toolchain + Solana CLI (for `cargo build-sbf` and `solana-test-validator`).
+  - `cargo-build-sbf --version` must show platform-tools Rust **>= 1.85** (do not assume system `cargo` version is enough).
   - Collin: Overview step `5) Solana readiness` -> `Start Solana (local)` / `sol_local_status`
   - Tools: `intercomswap_sol_local_start`, `intercomswap_sol_local_status`, `intercomswap_sol_local_stop`
   - These start a local `solana-test-validator` on `127.0.0.1:8899` and load the escrow program `.so` (ledger/logs under `onchain/`, gitignored).
