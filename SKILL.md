@@ -192,6 +192,11 @@ This repo also provides long-running RFQ “agent bots” that sit in an RFQ cha
   - **Permission note:** if your agent/runtime cannot execute `docker` commands (or cannot access the Docker daemon), stop and ask the human operator to start Docker and run the needed commands on your behalf (then paste the output back) before proceeding.
 - LN liquidity prerequisites:
   - Swaps will fail if the payer has no outbound liquidity, or the invoice receiver has no inbound liquidity.
+  - Practical first-trade rule: if a node opens its own first channel, it usually starts with near-100% local/outbound and ~0 remote/inbound.
+    - Result: that node can usually **sell BTC first** (pay LN), but cannot immediately **sell USDT first** (receive LN) until inbound is bootstrapped.
+    - Inbound bootstrap options:
+      1) have a counterparty open a channel to this node, or
+      2) rebalance by paying an invoice from this node to another controlled node.
   - Channels are not opened per trade. Open channels ahead of time (or rely on routing if you have a well-connected node).
   - See: "Live Ops Checklist" -> "Lightning liquidity prerequisites".
 - Solana RPC + keypair paths stored under `onchain/` + the SPL mint (`USDT` on mainnet).
@@ -444,6 +449,14 @@ A→Z operating flow:
    - Connect peer: `intercomswap_ln_connect` (`node_id`, `host`, `port`).
    - Open channel: `intercomswap_ln_fundchannel` (`node_id`, `satoshis`, optional fee params).
    - Verify channel state/capacity: `intercomswap_ln_listchannels`.
+   - Direction guardrail (must check before posting):
+     - `Sell BTC` requires outbound/local liquidity.
+     - `Sell USDT` requires inbound/remote liquidity.
+     - A newly self-opened channel often has inbound=0, so first `Sell USDT` is expected to fail until inbound is created.
+   - Deterministic inbound bootstrap (OpenClaw-safe):
+     1) On helper node B: create invoice with `intercomswap_ln_invoice_create`.
+     2) On trading node A: pay it with `intercomswap_ln_pay`.
+     3) Re-check with `intercomswap_ln_listchannels` until remote/inbound on A is sufficient for intended Sell USDT lines.
    - Add/remove liquidity:
      - If backend supports splicing: `intercomswap_ln_splice`.
      - If not: open additional channels and/or close/reopen (`intercomswap_ln_closechannel`).
