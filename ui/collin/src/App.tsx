@@ -2951,6 +2951,11 @@ function App() {
       out.autopost_error = e?.message || String(e);
     }
     try {
+      out.tradeauto = await runDirectToolOnce('intercomswap_tradeauto_status', {}, { auto_approve: false });
+    } catch (e: any) {
+      out.tradeauto_error = e?.message || String(e);
+    }
+    try {
       out.ln_info = await runDirectToolOnce('intercomswap_ln_info', {}, { auto_approve: false });
     } catch (e: any) {
       out.ln_info_error = e?.message || String(e);
@@ -3869,13 +3874,33 @@ function App() {
   const solConfigOk = !preflight?.sol_config_error;
 	  const needSolLocalStart = solKind === 'local' && !solLocalUp;
 	  const needLnBootstrap = isLnRegtestDocker && !lnWalletLocked && (lnChannelCount < 1 || Boolean(preflight?.ln_listfunds_error));
-	  const autopostJobs = Array.isArray((preflight as any)?.autopost?.jobs) ? (preflight as any).autopost.jobs : [];
-	  const offerAutopostJobs = autopostJobs.filter((j: any) => String(j?.tool || '') === 'intercomswap_offer_post');
-	  const rfqAutopostJobs = autopostJobs.filter((j: any) => String(j?.tool || '') === 'intercomswap_rfq_post');
-	  const oracle: OracleSummary = useMemo(() => {
-	    const p = preflight?.price && typeof preflight.price === 'object' ? (preflight.price as any) : null;
-	    return {
-	      ok: Boolean(p?.ok),
+  const autopostJobs = Array.isArray((preflight as any)?.autopost?.jobs) ? (preflight as any).autopost.jobs : [];
+  const offerAutopostJobs = autopostJobs.filter((j: any) => String(j?.tool || '') === 'intercomswap_offer_post');
+  const rfqAutopostJobs = autopostJobs.filter((j: any) => String(j?.tool || '') === 'intercomswap_rfq_post');
+  const tradeAutoStatus = (preflight as any)?.tradeauto && typeof (preflight as any).tradeauto === 'object'
+    ? ((preflight as any).tradeauto as any)
+    : null;
+  const tradeAutoRecent = useMemo(() => {
+    const rows = Array.isArray(tradeAutoStatus?.recent_events) ? tradeAutoStatus.recent_events : [];
+    return rows
+      .slice()
+      .reverse()
+      .map((evt: any, idx: number) => ({
+        _idx: idx,
+        ts: typeof evt?.ts === 'number' ? evt.ts : null,
+        type: String(evt?.type || 'trace'),
+        stage: String(evt?.stage || '').trim() || null,
+        trade_id: String(evt?.trade_id || '').trim() || null,
+        channel: String(evt?.channel || '').trim() || null,
+        sig: String(evt?.sig || '').trim() || null,
+        error: String(evt?.error || '').trim() || null,
+        cooldown_ms: typeof evt?.cooldown_ms === 'number' ? evt.cooldown_ms : null,
+      }));
+  }, [tradeAutoStatus?.recent_events]);
+  const oracle: OracleSummary = useMemo(() => {
+    const p = preflight?.price && typeof preflight.price === 'object' ? (preflight.price as any) : null;
+    return {
+      ok: Boolean(p?.ok),
 	      ts: typeof p?.ts === 'number' ? p.ts : null,
 	      btc_usd: typeof p?.btc_usd === 'number' && Number.isFinite(p.btc_usd) ? p.btc_usd : null,
 	      btc_usdt: typeof p?.btc_usdt === 'number' && Number.isFinite(p.btc_usdt) ? p.btc_usdt : null,
@@ -4220,6 +4245,81 @@ function App() {
                     onSelect={() => setSelected({ type: 'sc_event', evt: e })}
                     selected={selected?.type === 'sc_event' && selected?.evt?.seq === e.seq}
                   />
+                )}
+              />
+            </Panel>
+
+            <Panel title="Trade Automation Trace (Backend)">
+              <div className="row">
+                <span className={`chip ${tradeAutoStatus?.running ? 'hi' : 'warn'}`}>
+                  {tradeAutoStatus?.running ? 'running' : 'stopped'}
+                </span>
+                {tradeAutoStatus?.stats?.actions !== undefined ? (
+                  <span className="chip">actions: {Number(tradeAutoStatus.stats.actions || 0)}</span>
+                ) : null}
+                {tradeAutoStatus?.stats?.ticks !== undefined ? (
+                  <span className="chip">ticks: {Number(tradeAutoStatus.stats.ticks || 0)}</span>
+                ) : null}
+                {tradeAutoStatus?.stats?.last_tick_at ? (
+                  <span className="chip">last tick: {msToUtcIso(Number(tradeAutoStatus.stats.last_tick_at))}</span>
+                ) : null}
+              </div>
+              {preflight?.tradeauto_error ? (
+                <div className="alert bad" style={{ marginTop: 8 }}>
+                  tradeauto_status: {String(preflight.tradeauto_error)}
+                </div>
+              ) : null}
+              {tradeAutoStatus?.stats?.last_error ? (
+                <div className="alert warn" style={{ marginTop: 8 }}>
+                  last error: {String(tradeAutoStatus.stats.last_error)}
+                </div>
+              ) : null}
+              <div className="muted small" style={{ marginTop: 6 }}>
+                backend trace from <span className="mono">intercomswap_tradeauto_status</span> (newest first)
+              </div>
+              <VirtualList
+                items={tradeAutoRecent}
+                itemKey={(e) => `${e.ts || 0}:${e.type}:${e.stage || ''}:${e.trade_id || ''}:${e._idx}`}
+                estimatePx={84}
+                render={(e: any) => (
+                  <div className="rowitem">
+                    <div className="rowitem-top">
+                      <span className="mono chip">{String(e.type || 'trace')}</span>
+                      <span className="mono dim">{typeof e.ts === 'number' ? msToUtcIso(e.ts) : '—'}</span>
+                    </div>
+                    <div className="rowitem-mid">
+                      {e.trade_id ? (
+                        <div>
+                          trade: <span className="mono">{String(e.trade_id)}</span>
+                        </div>
+                      ) : null}
+                      {e.stage ? (
+                        <div>
+                          stage: <span className="mono">{String(e.stage)}</span>
+                        </div>
+                      ) : null}
+                      {e.channel ? (
+                        <div>
+                          channel: <span className="mono">{String(e.channel)}</span>
+                        </div>
+                      ) : null}
+                      {e.sig ? (
+                        <div>
+                          sig: <span className="mono">{String(e.sig)}</span>
+                        </div>
+                      ) : null}
+                      {typeof e.cooldown_ms === 'number' ? (
+                        <div>
+                          retry: <span className="mono">{Math.trunc(e.cooldown_ms)} ms</span>
+                        </div>
+                      ) : null}
+                      {e.error ? (
+                        <div className="mono" style={{ color: 'var(--bad)', whiteSpace: 'pre-wrap' }}>
+                          {String(e.error)}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
                 )}
               />
             </Panel>

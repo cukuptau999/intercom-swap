@@ -172,6 +172,8 @@ export class TradeAutoManager {
     this._preimageMax = 2000;
     this._lockMaxAgeMs = 20 * 60 * 1000;
     this._doneMaxAgeMs = 40 * 60 * 1000;
+    this._debugMax = 500;
+    this._debugEvents = [];
 
     this._autoQuotedRfqSig = new Set();
     this._autoAcceptedQuoteSig = new Set();
@@ -200,6 +202,20 @@ export class TradeAutoManager {
     }
   }
 
+  _trace(type, details = {}) {
+    try {
+      const evt = {
+        ts: Date.now(),
+        type: String(type || 'trace'),
+        ...(details && typeof details === 'object' ? details : {}),
+      };
+      this._debugEvents.push(evt);
+      if (this._debugEvents.length > this._debugMax) {
+        this._debugEvents.splice(0, this._debugEvents.length - this._debugMax);
+      }
+    } catch (_e) {}
+  }
+
   status() {
     return {
       type: 'tradeauto_status',
@@ -217,7 +233,9 @@ export class TradeAutoManager {
         stage_in_flight: this._stageInFlight.size,
         stage_retry_after: this._stageRetryAfter.size,
         trade_preimage: this._tradePreimage.size,
+        debug_events: this._debugEvents.length,
       },
+      recent_events: this._debugEvents.slice(-Math.min(200, this._debugMax)),
     };
   }
 
@@ -258,6 +276,11 @@ export class TradeAutoManager {
       max: 24 * 60 * 60 * 1000,
       fallback: Math.max(eventMaxAgeMs * 4, 20 * 60 * 1000),
     });
+    const debugMax = clampInt(toIntOrNull(opts.debug_max_events), {
+      min: 50,
+      max: 10_000,
+      fallback: 600,
+    });
     const defaultSolRefundWindowSec = clampInt(toIntOrNull(opts.default_sol_refund_window_sec), {
       min: 3600,
       max: 7 * 24 * 3600,
@@ -280,6 +303,7 @@ export class TradeAutoManager {
       preimage_max: preimageMax,
       lock_max_age_ms: lockMaxAgeMs,
       done_max_age_ms: doneMaxAgeMs,
+      debug_max_events: debugMax,
       default_sol_refund_window_sec: defaultSolRefundWindowSec,
       welcome_ttl_sec: welcomeTtlSec,
       ln_liquidity_mode: lnLiquidityMode,
@@ -301,6 +325,8 @@ export class TradeAutoManager {
     this._preimageMax = preimageMax;
     this._lockMaxAgeMs = lockMaxAgeMs;
     this._doneMaxAgeMs = doneMaxAgeMs;
+    this._debugMax = debugMax;
+    this._debugEvents = [];
     this._autoQuotedRfqSig.clear();
     this._autoAcceptedQuoteSig.clear();
     this._autoAcceptedTradeLock.clear();
@@ -318,6 +344,13 @@ export class TradeAutoManager {
       last_error: null,
       started_at: Date.now(),
     };
+    this._trace('tradeauto_start', {
+      channels,
+      interval_ms: intervalMs,
+      max_events: maxEvents,
+      max_trades: maxTrades,
+      ln_liquidity_mode: lnLiquidityMode,
+    });
 
     await this.runTool({ tool: 'intercomswap_sc_subscribe', args: { channels } });
 
@@ -351,6 +384,7 @@ export class TradeAutoManager {
     this._stageInFlight.clear();
     this._stageRetryAfter.clear();
     this._tradePreimage.clear();
+    this._trace('tradeauto_stop', { reason: String(reason || 'stopped') });
     return { type: 'tradeauto_stopped', reason: String(reason || 'stopped'), ...this.status() };
   }
 
@@ -372,12 +406,36 @@ export class TradeAutoManager {
     this._stageInFlight.delete(stageKey);
     this._stageRetryAfter.delete(stageKey);
     this._stageDone.set(stageKey, Date.now());
+    this._trace('stage_ok', { stage: String(stageKey) });
   }
 
   _markStageRetry(stageKey, cooldownMs) {
     if (!stageKey) return;
     this._stageInFlight.delete(stageKey);
     this._stageRetryAfter.set(stageKey, Date.now() + Math.max(1000, Math.trunc(cooldownMs || 1000)));
+    this._trace('stage_retry', { stage: String(stageKey), cooldown_ms: Math.max(1000, Math.trunc(cooldownMs || 1000)) });
+  }
+
+  _eventRetryKey(flow, sig) {
+    return `evt:${String(flow || '')}:${String(sig || '')}`;
+  }
+
+  _canRunEvent(flow, sig) {
+    if (!sig) return false;
+    const key = this._eventRetryKey(flow, sig);
+    const retryAfter = this._stageRetryAfter.get(key) || 0;
+    return Date.now() >= retryAfter;
+  }
+
+  _markEventRetry(flow, sig, cooldownMs = 5000) {
+    if (!sig) return;
+    const key = this._eventRetryKey(flow, sig);
+    this._stageRetryAfter.set(key, Date.now() + Math.max(1000, Math.trunc(cooldownMs || 1000)));
+  }
+
+  _clearEventRetry(flow, sig) {
+    if (!sig) return;
+    this._stageRetryAfter.delete(this._eventRetryKey(flow, sig));
   }
 
   _pruneTradeCachesById(tradeId) {
@@ -598,10 +656,9 @@ export class TradeAutoManager {
           if (isLocalEvent(rfqEvt)) continue;
           const sig = envelopeSig(rfqEvt);
           if (!sig || this._autoQuotedRfqSig.has(sig)) continue;
+          if (!this._canRunEvent('quote_from_offer', sig)) continue;
           const match = matchOfferForRfq({ rfqEvt, myOfferEvents: ctx.myOfferEvents });
           if (!match) continue;
-          this._autoQuotedRfqSig.add(sig);
-          this._pruneCaches();
           try {
             const ch = String(rfqEvt?.channel || '').trim();
             if (!ch) continue;
@@ -615,9 +672,20 @@ export class TradeAutoManager {
                 valid_for_sec: 180,
               },
             });
+            this._trace('auto_quote_ok', { trade_id: envelopeTradeId(rfqEvt), channel: ch, sig: sig.slice(0, 16) });
+            this._autoQuotedRfqSig.add(sig);
+            this._clearEventRetry('quote_from_offer', sig);
+            this._pruneCaches();
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            this._trace('auto_quote_fail', {
+              trade_id: envelopeTradeId(rfqEvt),
+              channel: String(rfqEvt?.channel || '').trim(),
+              sig: sig.slice(0, 16),
+              error: err?.message || String(err),
+            });
+            this._markEventRetry('quote_from_offer', sig, 5000);
             this._log(`[tradeauto] auto-quote failed: ${err?.message || String(err)}`);
           }
         }
@@ -630,12 +698,11 @@ export class TradeAutoManager {
           if (isEventStale(quoteEvt, this.opts.event_max_age_ms)) continue;
           const sig = envelopeSig(quoteEvt);
           if (!sig || this._autoAcceptedQuoteSig.has(sig)) continue;
+          if (!this._canRunEvent('accept_quote', sig)) continue;
           const tradeId = envelopeTradeId(quoteEvt);
           if (!tradeId || !ctx.myRfqTradeIds.has(tradeId)) continue;
           if (ctx.terminalTradeIds.has(tradeId)) continue;
           if (this._autoAcceptedTradeLock.has(tradeId)) continue;
-          this._autoAcceptedQuoteSig.add(sig);
-          this._pruneCaches();
           try {
             await this.runTool({
               tool: 'intercomswap_quote_accept',
@@ -645,11 +712,25 @@ export class TradeAutoManager {
                 ln_liquidity_mode: this.opts.ln_liquidity_mode,
               },
             });
+            this._trace('auto_accept_ok', {
+              trade_id: tradeId,
+              channel: String(quoteEvt?.channel || '').trim(),
+              quote_sig: sig.slice(0, 16),
+            });
+            this._autoAcceptedQuoteSig.add(sig);
+            this._clearEventRetry('accept_quote', sig);
             this._autoAcceptedTradeLock.set(tradeId, Date.now());
             this._pruneCaches();
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            this._trace('auto_accept_fail', {
+              trade_id: tradeId,
+              channel: String(quoteEvt?.channel || '').trim(),
+              quote_sig: sig.slice(0, 16),
+              error: err?.message || String(err),
+            });
+            this._markEventRetry('accept_quote', sig, 5000);
             this._log(`[tradeauto] auto-accept failed: ${err?.message || String(err)}`);
           }
         }
@@ -662,11 +743,10 @@ export class TradeAutoManager {
           if (isEventStale(e, this.opts.event_max_age_ms)) continue;
           const sig = envelopeSig(e);
           if (!sig || this._autoInvitedAcceptSig.has(sig)) continue;
+          if (!this._canRunEvent('invite_from_accept', sig)) continue;
           const quoteId = String(e?.message?.body?.quote_id || '').trim().toLowerCase();
           const myQuote = ctx.myQuoteById.get(quoteId);
           if (!myQuote) continue;
-          this._autoInvitedAcceptSig.add(sig);
-          this._pruneCaches();
           try {
             const tradeId = envelopeTradeId(e);
             const out = await this.runTool({
@@ -679,11 +759,26 @@ export class TradeAutoManager {
                 ttl_sec: this.opts.welcome_ttl_sec,
               },
             });
+            this._trace('auto_invite_ok', {
+              trade_id: tradeId,
+              channel: String(e?.channel || myQuote.channel || '').trim(),
+              accept_sig: sig.slice(0, 16),
+            });
+            this._autoInvitedAcceptSig.add(sig);
+            this._clearEventRetry('invite_from_accept', sig);
+            this._pruneCaches();
             const swapCh = String(out?.swap_channel || '').trim();
             if (swapCh) await this.runTool({ tool: 'intercomswap_sc_subscribe', args: { channels: [swapCh] } });
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            this._trace('auto_invite_fail', {
+              trade_id: envelopeTradeId(e),
+              channel: String(e?.channel || myQuote.channel || '').trim(),
+              accept_sig: sig.slice(0, 16),
+              error: err?.message || String(err),
+            });
+            this._markEventRetry('invite_from_accept', sig, 5000);
             this._log(`[tradeauto] auto-invite failed: ${err?.message || String(err)}`);
           }
         }
@@ -696,22 +791,36 @@ export class TradeAutoManager {
           if (isEventStale(e, this.opts.event_max_age_ms)) continue;
           const sig = envelopeSig(e);
           if (!sig || this._autoJoinedInviteSig.has(sig)) continue;
+          if (!this._canRunEvent('join_invite', sig)) continue;
           const tradeId = envelopeTradeId(e);
           if (tradeId && ctx.terminalTradeIds.has(tradeId)) continue;
           const invitee = String(e?.message?.body?.invite?.payload?.inviteePubKey || '').trim().toLowerCase();
           if (invitee && localPeer && invitee !== localPeer) continue;
-          this._autoJoinedInviteSig.add(sig);
-          this._pruneCaches();
           try {
             const out = await this.runTool({
               tool: 'intercomswap_join_from_swap_invite',
               args: { swap_invite_envelope: e.message },
             });
+            this._trace('auto_join_ok', {
+              trade_id: tradeId,
+              channel: String(e?.channel || '').trim(),
+              invite_sig: sig.slice(0, 16),
+            });
+            this._autoJoinedInviteSig.add(sig);
+            this._clearEventRetry('join_invite', sig);
+            this._pruneCaches();
             const swapCh = String(out?.swap_channel || e?.message?.body?.swap_channel || '').trim();
             if (swapCh) await this.runTool({ tool: 'intercomswap_sc_subscribe', args: { channels: [swapCh] } });
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            this._trace('auto_join_fail', {
+              trade_id: tradeId,
+              channel: String(e?.channel || '').trim(),
+              invite_sig: sig.slice(0, 16),
+              error: err?.message || String(err),
+            });
+            this._markEventRetry('join_invite', sig, 5000);
             this._log(`[tradeauto] auto-join failed: ${err?.message || String(err)}`);
           }
         }
@@ -809,6 +918,7 @@ export class TradeAutoManager {
                 actionsLeft -= 1;
                 this._stats.actions += 1;
               } catch (err) {
+                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: err?.message || String(err) });
                 this._markStageRetry(stageKey, 10_000);
                 this._log(`[tradeauto] ${stageKey} failed: ${err?.message || String(err)}`);
               }
@@ -831,6 +941,7 @@ export class TradeAutoManager {
                 actionsLeft -= 1;
                 this._stats.actions += 1;
               } catch (err) {
+                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: err?.message || String(err) });
                 this._markStageRetry(stageKey, 10_000);
                 this._log(`[tradeauto] ${stageKey} failed: ${err?.message || String(err)}`);
               }
@@ -859,6 +970,7 @@ export class TradeAutoManager {
                 actionsLeft -= 1;
                 this._stats.actions += 1;
               } catch (err) {
+                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: err?.message || String(err) });
                 this._markStageRetry(stageKey, 10_000);
                 this._log(`[tradeauto] ${stageKey} failed: ${err?.message || String(err)}`);
               }
@@ -907,6 +1019,7 @@ export class TradeAutoManager {
                 actionsLeft -= 1;
                 this._stats.actions += 1;
               } catch (err) {
+                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: err?.message || String(err) });
                 this._markStageRetry(stageKey, 10_000);
                 this._log(`[tradeauto] ${stageKey} failed: ${err?.message || String(err)}`);
               }
@@ -937,6 +1050,7 @@ export class TradeAutoManager {
                 actionsLeft -= 1;
                 this._stats.actions += 1;
               } catch (err) {
+                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: err?.message || String(err) });
                 this._markStageRetry(stageKey, 10_000);
                 this._log(`[tradeauto] ${stageKey} failed: ${err?.message || String(err)}`);
               }
@@ -971,6 +1085,7 @@ export class TradeAutoManager {
                 actionsLeft -= 1;
                 this._stats.actions += 1;
               } catch (err) {
+                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: err?.message || String(err) });
                 this._markStageRetry(stageKey, 15_000);
                 this._log(`[tradeauto] ${stageKey} failed: ${err?.message || String(err)}`);
               }
