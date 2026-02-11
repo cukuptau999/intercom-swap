@@ -140,6 +140,34 @@ function impliedPriceUsdtPerBtc({ btcSats, usdtAmount, usdtDecimals }) {
   }
 }
 
+function normalizeAmountString(value) {
+  const s = String(value ?? '').trim();
+  if (!s) return '0';
+  if (!/^[0-9]+$/.test(s)) return s;
+  const n = s.replace(/^0+(?=\d)/, '');
+  return n || '0';
+}
+
+function buildRfqLockKey(msg) {
+  const body = msg?.body && typeof msg.body === 'object' ? msg.body : {};
+  return [
+    String(msg?.signer || '').trim().toLowerCase(),
+    String(msg?.trade_id || '').trim(),
+    String(body.pair || '').trim(),
+    String(body.direction || '').trim(),
+    String(body.btc_sats ?? '').trim(),
+    normalizeAmountString(body.usdt_amount),
+    String(body.max_platform_fee_bps ?? '').trim(),
+    String(body.max_trade_fee_bps ?? '').trim(),
+    String(body.max_total_fee_bps ?? '').trim(),
+    String(body.min_sol_refund_window_sec ?? '').trim(),
+    String(body.max_sol_refund_window_sec ?? '').trim(),
+    String(body.sol_recipient || '').trim().toLowerCase(),
+    String(body.sol_mint || '').trim(),
+    String(body.app_hash || '').trim().toLowerCase(),
+  ].join('|');
+}
+
 async function sendAndConfirm(connection, tx) {
   const sig = await connection.sendRawTransaction(tx.serialize());
   const conf = await connection.confirmTransaction(sig, 'confirmed');
@@ -262,6 +290,45 @@ async function main() {
   const quotes = new Map(); // quote_id -> { rfq_id, trade_id, btc_sats, usdt_amount, sol_recipient, sol_mint }
   const swaps = new Map(); // swap_channel -> ctx
   const pendingSwaps = new Map(); // swap_channel -> invitee_pubkey (dedupe concurrent QUOTE_ACCEPT handlers)
+  const rfqLocks = new Map(); // lockKey -> { state, tradeId, quoteId, ... }
+  const quoteIdToLockKey = new Map(); // quote_id -> lockKey
+  const tradeIdToLockKey = new Map(); // trade_id -> lockKey
+  const swapChannelToLockKey = new Map(); // swap_channel -> lockKey
+
+  const clearRfqLock = (lockKey, reason = 'unknown') => {
+    if (!lockKey) return;
+    const lock = rfqLocks.get(lockKey);
+    rfqLocks.delete(lockKey);
+    if (!lock) return;
+    if (lock.quoteId) quoteIdToLockKey.delete(lock.quoteId);
+    if (lock.tradeId && tradeIdToLockKey.get(lock.tradeId) === lockKey) tradeIdToLockKey.delete(lock.tradeId);
+    if (lock.swapChannel && swapChannelToLockKey.get(lock.swapChannel) === lockKey) swapChannelToLockKey.delete(lock.swapChannel);
+    if (debug) {
+      process.stderr.write(
+        `[maker] clear rfq lock trade_id=${lock.tradeId || '-'} state=${lock.state || '-'} reason=${String(reason || 'unknown')}\n`
+      );
+    }
+  };
+
+  const lockPruneTimer = setInterval(() => {
+    const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+    for (const [lockKey, lock] of rfqLocks.entries()) {
+      if (!lock || typeof lock !== 'object') {
+        clearRfqLock(lockKey, 'invalid_lock');
+        continue;
+      }
+      if (lock.state === 'quoted') {
+        const until = Number(lock.quoteValidUntilUnix || 0);
+        if (Number.isFinite(until) && until > 0 && nowSec > until) clearRfqLock(lockKey, 'quote_expired');
+        continue;
+      }
+      if (lock.state === 'accepting' || lock.state === 'swapping') {
+        const deadline = Number(lock.lockDeadlineMs || 0);
+        if (Number.isFinite(deadline) && deadline > 0 && nowMs > deadline) clearRfqLock(lockKey, 'lock_timeout');
+      }
+    }
+  }, 5_000);
 
   const fetchBtcUsdtMedian = async () => {
     const res = await sc.priceGet();
@@ -323,6 +390,9 @@ async function main() {
     const delay = Number.isFinite(onceExitDelayMs) ? Math.max(onceExitDelayMs, 0) : 0;
     setTimeout(() => {
       try {
+        clearInterval(lockPruneTimer);
+      } catch (_e) {}
+      try {
         receipts?.close();
       } catch (_e) {}
       sc.close();
@@ -356,6 +426,13 @@ async function main() {
     try {
       swaps.delete(ctx.swapChannel);
     } catch (_e) {}
+    try {
+      pendingSwaps.delete(ctx.swapChannel);
+    } catch (_e) {}
+    {
+      const lockKey = swapChannelToLockKey.get(ctx.swapChannel) || tradeIdToLockKey.get(ctx.tradeId) || null;
+      clearRfqLock(lockKey, reason || 'swap_cleanup');
+    }
     if (sendCancel) {
       // Best-effort: cancellation is only accepted before escrow creation.
       await cancelSwap(ctx, reason || 'swap timeout');
@@ -661,12 +738,16 @@ async function main() {
           await createInvoiceAndEscrow(ctx);
         }
 
-        if (ctx.trade.state === STATE.CLAIMED && !ctx.done) {
+        if ([STATE.CLAIMED, STATE.REFUNDED, STATE.CANCELED].includes(ctx.trade.state) && !ctx.done) {
           ctx.done = true;
           done = true;
-          process.stdout.write(`${JSON.stringify({ type: 'swap_done', trade_id: ctx.tradeId, swap_channel: ctx.swapChannel })}\n`);
-          persistTrade(ctx.tradeId, { state: ctx.trade.state }, 'swap_done', { trade_id: ctx.tradeId });
-          await cleanupSwap(ctx, { reason: 'swap_done' });
+          const evtType =
+            ctx.trade.state === STATE.CLAIMED ? 'swap_done' : (ctx.trade.state === STATE.REFUNDED ? 'swap_refunded' : 'swap_canceled');
+          process.stdout.write(
+            `${JSON.stringify({ type: evtType, trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, state: ctx.trade.state })}\n`
+          );
+          persistTrade(ctx.tradeId, { state: ctx.trade.state }, evtType, { trade_id: ctx.tradeId, state: ctx.trade.state });
+          await cleanupSwap(ctx, { reason: ctx.trade.state === STATE.CLAIMED ? 'swap_done' : String(ctx.trade.state).toLowerCase() });
           maybeExit();
         }
         return;
@@ -695,6 +776,37 @@ async function main() {
         if (runSwap && !solRecipient) {
           if (debug) process.stderr.write(`[maker] skip rfq missing sol_recipient trade_id=${msg.trade_id} rfq_id=${rfqId}\n`);
           return;
+        }
+        const lockKey = buildRfqLockKey(msg);
+        const lockNowMs = Date.now();
+        const lockNowSec = Math.floor(lockNowMs / 1000);
+        const existingLock = rfqLocks.get(lockKey);
+        if (existingLock) {
+          existingLock.lastSeenMs = lockNowMs;
+          const quotedUntil = Number(existingLock.quoteValidUntilUnix || 0);
+          if (
+            existingLock.state === 'quoted' &&
+            existingLock.signedQuote &&
+            Number.isFinite(quotedUntil) &&
+            quotedUntil > lockNowSec
+          ) {
+            ensureOk(await sc.send(rfqChannel, existingLock.signedQuote), 'resend quote');
+            if (debug) {
+              process.stderr.write(
+                `[maker] resend existing quote trade_id=${msg.trade_id} rfq_id=${rfqId} quote_id=${existingLock.quoteId}\n`
+              );
+            }
+            return;
+          }
+          if (existingLock.state === 'accepting' || existingLock.state === 'swapping') {
+            if (debug) {
+              process.stderr.write(`[maker] skip rfq repost while in-flight trade_id=${msg.trade_id} state=${existingLock.state}\n`);
+            }
+            return;
+          }
+          if (existingLock.state === 'quoted' && Number.isFinite(quotedUntil) && quotedUntil <= lockNowSec) {
+            clearRfqLock(lockKey, 'quote_expired_repost');
+          }
         }
 
         // Pre-filtering: only quote if we can meet the RFQ fee ceilings.
@@ -750,48 +862,50 @@ async function main() {
           return;
         }
 
-        let quoteUsdtAmount = String(msg.body.usdt_amount);
+        let quoteUsdtAmount = String(msg.body.usdt_amount || '').trim();
+        if (!quoteUsdtAmount) quoteUsdtAmount = '0';
         if (priceGuard) {
-          const px = await fetchBtcUsdtMedian();
-          if (!px.ok) {
-            if (debug) process.stderr.write(`[maker] skip rfq: price guard ${px.error}\n`);
-            return;
-          }
-
-          const oracleAmount = quoteUsdtAmountFromOracle({
-            btcSats: msg.body.btc_sats,
-            priceUsdtPerBtc: px.median,
-            usdtDecimals: solDecimals,
-            spreadBps: makerSpreadBps,
-          });
-          if (!oracleAmount || oracleAmount === '0') {
-            if (debug) process.stderr.write(`[maker] skip rfq: computed usdt_amount invalid\n`);
-            return;
-          }
-
-          const rfqAmountTrimmed = String(msg.body.usdt_amount || '').trim();
+          // Informative oracle mode for fixed-price RFQs:
+          // - If usdt_amount is set by requester, keep that price and only log advisory.
+          // - If usdt_amount is open/zero, derive the quote from oracle.
+          const rfqAmountTrimmed = String(quoteUsdtAmount).trim();
           const rfqIsOpen = rfqAmountTrimmed === '' || rfqAmountTrimmed === '0';
+          const px = await fetchBtcUsdtMedian();
 
           if (rfqIsOpen) {
+            if (!px.ok) {
+              if (debug) process.stderr.write(`[maker] skip rfq open amount: oracle unavailable (${px.error})\n`);
+              return;
+            }
+            const oracleAmount = quoteUsdtAmountFromOracle({
+              btcSats: msg.body.btc_sats,
+              priceUsdtPerBtc: px.median,
+              usdtDecimals: solDecimals,
+              spreadBps: makerSpreadBps,
+            });
+            if (!oracleAmount || oracleAmount === '0') {
+              if (debug) process.stderr.write('[maker] skip rfq open amount: computed usdt_amount invalid\n');
+              return;
+            }
             quoteUsdtAmount = oracleAmount;
           } else {
-            const rfqPrice = impliedPriceUsdtPerBtc({
-              btcSats: msg.body.btc_sats,
-              usdtAmount: rfqAmountTrimmed,
-              usdtDecimals: solDecimals,
-            });
-            if (rfqPrice === null || !Number.isFinite(rfqPrice) || rfqPrice <= 0) {
-              // If RFQ cannot be evaluated, fall back to oracle-based quote.
-              quoteUsdtAmount = oracleAmount;
-            } else {
-              const overpayBps = ((rfqPrice / px.median) - 1) * 10_000;
-              if (Number.isFinite(overpayBps) && overpayBps <= makerMaxOverpayBps) {
-                // RFQ price is acceptable for the maker: echo requested terms.
-                quoteUsdtAmount = rfqAmountTrimmed;
-              } else {
-                // Counterquote based on oracle.
-                quoteUsdtAmount = oracleAmount;
+            quoteUsdtAmount = rfqAmountTrimmed;
+            if (px.ok) {
+              const rfqPrice = impliedPriceUsdtPerBtc({
+                btcSats: msg.body.btc_sats,
+                usdtAmount: rfqAmountTrimmed,
+                usdtDecimals: solDecimals,
+              });
+              if (rfqPrice !== null && Number.isFinite(rfqPrice) && rfqPrice > 0) {
+                const overpayBps = ((rfqPrice / px.median) - 1) * 10_000;
+                if (Number.isFinite(overpayBps) && overpayBps > makerMaxOverpayBps && debug) {
+                  process.stderr.write(
+                    `[maker] price guard advisory: rfq price over oracle by ${Math.round(overpayBps)} bps (trade_id=${msg.trade_id})\n`
+                  );
+                }
               }
+            } else if (debug) {
+              process.stderr.write(`[maker] price guard advisory unavailable: ${px.error}\n`);
             }
           }
         } else {
@@ -801,6 +915,7 @@ async function main() {
 
         // Quote at chosen terms.
         const nowSec = Math.floor(Date.now() / 1000);
+        const quoteValidUntilUnix = nowSec + quoteValidSec;
         const quoteUnsigned = createUnsignedEnvelope({
           v: 1,
           kind: KIND.QUOTE,
@@ -819,7 +934,7 @@ async function main() {
             trade_fee_collector: fees.tradeFeeCollector ? fees.tradeFeeCollector.toBase58() : null,
             sol_refund_window_sec: solRefundAfterSec,
             ...(runSwap ? { sol_mint: sol.mint.toBase58(), sol_recipient: solRecipient } : {}),
-            valid_until_unix: nowSec + quoteValidSec,
+            valid_until_unix: quoteValidUntilUnix,
           },
         });
         const quoteId = hashUnsignedEnvelope(quoteUnsigned);
@@ -839,7 +954,24 @@ async function main() {
           sol_refund_window_sec: solRefundAfterSec,
           sol_recipient: solRecipient,
           sol_mint: runSwap ? sol.mint.toBase58() : (msg.body?.sol_mint ? String(msg.body.sol_mint).trim() : ''),
+          lock_key: lockKey,
         });
+        rfqLocks.set(lockKey, {
+          key: lockKey,
+          state: 'quoted',
+          tradeId: String(msg.trade_id),
+          rfqSigner: String(msg.signer || '').trim().toLowerCase(),
+          quoteId,
+          signedQuote: signed,
+          quoteValidUntilUnix,
+          swapChannel: null,
+          inviteePubKey: null,
+          lockDeadlineMs: 0,
+          createdAtMs: lockNowMs,
+          lastSeenMs: lockNowMs,
+        });
+        quoteIdToLockKey.set(quoteId, lockKey);
+        tradeIdToLockKey.set(String(msg.trade_id), lockKey);
         return;
       }
 
@@ -851,6 +983,8 @@ async function main() {
         const known = quotes.get(quoteId);
         if (!known) return;
         if (known.rfq_id !== rfqId) return;
+        const lockKey = known.lock_key || quoteIdToLockKey.get(quoteId) || null;
+        const lock = lockKey ? rfqLocks.get(lockKey) : null;
 
         const tradeId = String(msg.trade_id);
         if (String(known.trade_id) !== tradeId) return;
@@ -874,6 +1008,15 @@ async function main() {
         if (!isRetry) {
           // Mark early to dedupe concurrent QUOTE_ACCEPT handlers (node event handlers are not awaited).
           pendingSwaps.set(swapChannel, inviteePubKey);
+          if (lock) {
+            lock.state = 'accepting';
+            lock.inviteePubKey = inviteePubKey;
+            lock.swapChannel = swapChannel;
+            lock.lockDeadlineMs = Date.now() + Math.max(1, swapTimeoutSec) * 1000;
+            lock.lastSeenMs = Date.now();
+            tradeIdToLockKey.set(tradeId, lockKey);
+            swapChannelToLockKey.set(swapChannel, lockKey);
+          }
         }
 
         // Build welcome + invite signed by this peer (local keypair signing).
@@ -910,9 +1053,9 @@ async function main() {
           },
         });
         const swapInviteSigned = signSwapEnvelope(swapInviteUnsigned, signing);
-        // If this was a retry (existing swap or swap setup in-flight), just re-send the invite and return.
+        // Suppress repost handling once quote_accept/invite is in-flight for this trade_id.
         if (isRetry) {
-          ensureOk(await sc.send(rfqChannel, swapInviteSigned), 'send swap_invite');
+          if (debug) process.stderr.write(`[maker] ignore duplicate quote_accept while in-flight trade_id=${tradeId} swap_channel=${swapChannel}\n`);
           return;
         }
 
@@ -949,6 +1092,14 @@ async function main() {
             resender: null,
           };
           swaps.set(swapChannel, ctx);
+          if (lock) {
+            lock.state = 'swapping';
+            lock.swapChannel = swapChannel;
+            lock.inviteePubKey = inviteePubKey;
+            lock.lockDeadlineMs = Date.now() + Math.max(1, swapTimeoutSec) * 1000;
+            lock.lastSeenMs = Date.now();
+            swapChannelToLockKey.set(swapChannel, lockKey);
+          }
 
           // Begin swap: send terms and start the resend loop.
           await createAndSendTerms(ctx);
@@ -971,6 +1122,17 @@ async function main() {
             'swap_started',
             { trade_id: tradeId, swap_channel: swapChannel }
           );
+        } catch (err) {
+          // If invite/swap startup fails before the swap loop settles, roll back lock to allow a clean retry.
+          if (lock) {
+            lock.state = 'quoted';
+            lock.inviteePubKey = null;
+            lock.swapChannel = null;
+            lock.lockDeadlineMs = 0;
+            lock.lastSeenMs = Date.now();
+          }
+          swapChannelToLockKey.delete(swapChannel);
+          throw err;
         } finally {
           pendingSwaps.delete(swapChannel);
         }

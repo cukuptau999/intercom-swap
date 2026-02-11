@@ -1256,6 +1256,7 @@ function App() {
   const knownChannelsForInputs = useMemo(() => knownChannels.slice(0, 500), [knownChannels]);
 
   const autoAcceptedQuoteSigRef = useRef<Set<string>>(new Set());
+  const autoAcceptedTradeIdRef = useRef<Set<string>>(new Set());
   const autoRfqFromOfferLineRef = useRef<Set<string>>(new Set());
   const autoQuotedRfqSigRef = useRef<Set<string>>(new Set());
   const autoInvitedAcceptSigRef = useRef<Set<string>>(new Set());
@@ -1618,6 +1619,10 @@ function App() {
       return;
     }
     autoAcceptLockedWarnedRef.current = false;
+    // Release dedupe locks once a trade reaches terminal state.
+    for (const tid of Array.from(autoAcceptedTradeIdRef.current)) {
+      if (terminalTradeIdsSet.has(tid)) autoAcceptedTradeIdRef.current.delete(tid);
+    }
     let cancelled = false;
     void (async () => {
       const queue = [...quoteEvents].reverse();
@@ -1625,9 +1630,14 @@ function App() {
         if (cancelled) return;
         const sig = String((quoteEvt as any)?.message?.sig || '').trim().toLowerCase();
         if (!sig || autoAcceptedQuoteSigRef.current.has(sig)) continue;
+        const tradeId = String((quoteEvt as any)?.trade_id || (quoteEvt as any)?.message?.trade_id || '').trim();
+        if (tradeId && autoAcceptedTradeIdRef.current.has(tradeId) && !terminalTradeIdsSet.has(tradeId)) {
+          continue;
+        }
         autoAcceptedQuoteSigRef.current.add(sig);
         try {
           const out = await acceptQuoteEnvelope(quoteEvt, { origin: 'auto' });
+          if (tradeId) autoAcceptedTradeIdRef.current.add(tradeId);
           const quoteId = String((out as any)?.quote_id || '').trim();
           pushToast('success', `Auto-accepted quote${quoteId ? ` (${quoteId.slice(0, 12)}…)` : ''}`);
         } catch (err: any) {
@@ -1639,7 +1649,7 @@ function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [health?.ok, autoAcceptQuotes, quoteEvents, lnLiquidityMode, lnWalletLocked]);
+  }, [health?.ok, autoAcceptQuotes, quoteEvents, lnLiquidityMode, lnWalletLocked, terminalTradeIdsSet]);
 
   useEffect(() => {
     if (!health?.ok || !autoInviteFromAccepts) return;
