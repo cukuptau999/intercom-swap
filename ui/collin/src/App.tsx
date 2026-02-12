@@ -6700,7 +6700,7 @@ function App() {
                   Open channels to add liquidity. Reusing the same peer is valid and increases total routing capacity.
                 </div>
 
-                <div className="gridform" style={{ marginTop: 8 }}>
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <div className="field">
                     <div className="field-hd">
                       <span className="mono">Liquidity Guardrail</span>
