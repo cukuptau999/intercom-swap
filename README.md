@@ -1,3 +1,5 @@
+Reward Address: trac1z2qws0feumcyqml6gggd3k7yc4mgxqmnmhrncprm0y94nkgvtvqsqagydn
+
 # Intercom Swap
 
 This repo is a fork of upstream **Intercom** (Trac-Systems/intercom): a reference implementation of the Intercom stack on Trac Network for an internet of agents.
